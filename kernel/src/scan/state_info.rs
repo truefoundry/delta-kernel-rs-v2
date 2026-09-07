@@ -234,6 +234,12 @@ impl StateInfo {
         stats_output_mode: StatsOutputMode,
         classifier: C,
     ) -> DeltaResult<Self> {
+        ensure_ignored_columns_not_referenced(
+            &logical_schema,
+            predicate.as_ref(),
+            table_configuration.ignored_columns(),
+        )?;
+
         let partition_columns = table_configuration.partition_columns();
         let column_mapping_mode = table_configuration.column_mapping_mode();
         let mut read_fields = Vec::with_capacity(logical_schema.num_fields());
@@ -431,6 +437,54 @@ impl StateInfo {
         } else {
             512
         }
+    }
+}
+
+fn ensure_ignored_columns_not_referenced(
+    logical_schema: &StructType,
+    predicate: Option<&PredicateRef>,
+    ignored_columns: &HashSet<ColumnName>,
+) -> DeltaResult<()> {
+    if let Some(ignored) = ignored_columns
+        .iter()
+        .find(|column| schema_contains_column_path(logical_schema, column.path()))
+    {
+        return Err(Error::missing_column(format!(
+            "Scan schema references ignored column: {ignored}"
+        )));
+    }
+    if let Some(ignored) = predicate.and_then(|predicate| {
+        predicate
+            .references()
+            .into_iter()
+            .find(|reference| ignored_columns.contains(reference.path()))
+    }) {
+        return Err(Error::missing_column(format!(
+            "Predicate references ignored column: {ignored}"
+        )));
+    }
+    Ok(())
+}
+
+fn schema_contains_column_path(schema: &StructType, path: &[String]) -> bool {
+    let Some((name, remaining)) = path.split_first() else {
+        return false;
+    };
+    let Some(field) = schema.field(name) else {
+        return false;
+    };
+    remaining.is_empty() || data_type_contains_column_path(field.data_type(), remaining)
+}
+
+fn data_type_contains_column_path(data_type: &DataType, path: &[String]) -> bool {
+    match data_type {
+        DataType::Struct(inner) => schema_contains_column_path(inner, path),
+        DataType::Array(array) => data_type_contains_column_path(&array.element_type, path),
+        DataType::Map(map) => {
+            data_type_contains_column_path(&map.key_type, path)
+                || data_type_contains_column_path(&map.value_type, path)
+        }
+        DataType::Primitive(_) | DataType::Variant(_) => false,
     }
 }
 
@@ -706,6 +760,31 @@ pub(crate) mod tests {
             }
             _ => panic!("Expected PhysicalPredicate::Some"),
         }
+    }
+
+    #[test]
+    fn ignored_column_cannot_be_requested_in_scan_schema() {
+        let schema =
+            StructType::new_unchecked([StructField::nullable("ignored", DataType::STRING)]);
+        let ignored = HashSet::from([ColumnName::new(["ignored"])]);
+
+        assert_result_error_with_message(
+            ensure_ignored_columns_not_referenced(&schema, None, &ignored),
+            "Scan schema references ignored column: ignored",
+        );
+    }
+
+    #[test]
+    fn ignored_column_cannot_be_referenced_by_predicate() {
+        let schema =
+            StructType::new_unchecked([StructField::nullable("Ignored", DataType::STRING)]);
+        let predicate = Arc::new(column_expr!("ignored").eq(Expr::literal("value")));
+        let ignored = HashSet::from([ColumnName::new(["ignored"])]);
+
+        assert_result_error_with_message(
+            ensure_ignored_columns_not_referenced(&schema, Some(&predicate), &ignored),
+            "Predicate references ignored column: ignored",
+        );
     }
 
     #[test]
