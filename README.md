@@ -40,6 +40,21 @@ cargo test --all-features
 This will build the kernel, run all unit tests, fetch the [Delta Acceptance Tests][dat] data and run
 the acceptance tests against it.
 
+### Ignoring incompatible columns
+
+For read-only access to a table whose schema contains names that differ only by case, set
+`DELTA_KERNEL_IGNORE_COLUMNS` to an exact, case-sensitive list of logical column paths:
+
+```sh
+DELTA_KERNEL_IGNORE_COLUMNS='events.foo'
+```
+
+Configured columns are removed from the table schema before validation. Backticks support field
+names containing dots, commas, or spaces. Kernel rejects ignored partition columns, references to
+ignored columns in scan projections or predicates, and all writes while any table columns are
+ignored. This is a compatibility override for reading an invalid Delta schema; it does not modify
+the table or its files.
+
 In general, you will want to depend on `delta-kernel-rs` by adding it as a dependency to your
 `Cargo.toml`, (that is, for rust projects using cargo) for other projects please see the [FFI]
 module. The core kernel includes facilities for reading and writing delta tables, and allows the

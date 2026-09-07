@@ -1,16 +1,18 @@
 //! Provides parsing and manipulation of the various actions defined in the [Delta
 //! specification](https://github.com/delta-io/delta/blob/master/PROTOCOL.md)
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
 use delta_kernel_derive::{internal_api, IntoEngineData, ToSchema};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tracing::warn;
 use url::Url;
 use visitors::{MetadataVisitor, ProtocolVisitor};
 
 use self::deletion_vector::DeletionVectorDescriptor;
-use crate::expressions::{MapData, Scalar, StructData};
+use crate::expressions::{ColumnName, MapData, Scalar, StructData};
 use crate::schema::{DataType, MapType, SchemaRef, StructField, StructType, ToSchema as _};
 use crate::table_features::{
     FeatureType, IntoTableFeature, TableFeature, MIN_VALID_RW_VERSION,
@@ -25,6 +27,8 @@ use crate::{
 
 const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
 const UNKNOWN_OPERATION: &str = "UNKNOWN";
+// Exact, case-sensitive logical column paths to omit when reading an invalid table schema.
+pub(crate) const IGNORED_COLUMNS_ENV_VAR: &str = "DELTA_KERNEL_IGNORE_COLUMNS";
 
 pub mod deletion_vector;
 pub mod deletion_vector_writer;
@@ -351,7 +355,45 @@ impl Metadata {
 
     #[internal_api]
     pub(crate) fn parse_schema(&self) -> DeltaResult<StructType> {
-        Ok(serde_json::from_str(&self.schema_string)?)
+        Ok(self.parse_schema_with_ignored_columns()?.schema)
+    }
+
+    /// Parses the table schema, omitting the columns configured through
+    /// [`IGNORED_COLUMNS_ENV_VAR`].
+    ///
+    /// Returns the parsed schema along with the paths that were actually removed, or an error if
+    /// the environment variable is malformed or the (filtered) schema is invalid.
+    pub(crate) fn parse_schema_with_ignored_columns(&self) -> DeltaResult<ParsedTableSchema> {
+        self.parse_schema_ignoring(&ignored_columns_from_env()?)
+    }
+
+    /// Parses the table schema, omitting `ignored_columns`. Paths are matched exactly, so casing
+    /// must match the schema.
+    fn parse_schema_ignoring(
+        &self,
+        ignored_columns: &HashSet<ColumnName>,
+    ) -> DeltaResult<ParsedTableSchema> {
+        let mut schema_json: Value = serde_json::from_str(&self.schema_string)?;
+        let mut removed_columns = HashSet::new();
+        filter_ignored_columns(
+            &mut schema_json,
+            ignored_columns,
+            &mut Vec::new(),
+            &mut removed_columns,
+        );
+
+        let schema = serde_json::from_value(schema_json)?;
+        for column in &removed_columns {
+            warn!(
+                column = %column,
+                env_var = IGNORED_COLUMNS_ENV_VAR,
+                "Ignoring table column configured through the environment"
+            );
+        }
+        Ok(ParsedTableSchema {
+            schema,
+            ignored_columns: removed_columns,
+        })
     }
 
     #[internal_api]
@@ -412,6 +454,112 @@ impl Metadata {
             created_time,
             configuration,
         }
+    }
+}
+
+/// A table schema parsed from [`Metadata`], along with the logical column paths that were omitted.
+pub(crate) struct ParsedTableSchema {
+    pub(crate) schema: StructType,
+    pub(crate) ignored_columns: HashSet<ColumnName>,
+}
+
+/// Reads the configured ignore list, returning an empty set when the variable is unset.
+fn ignored_columns_from_env() -> DeltaResult<HashSet<ColumnName>> {
+    let value = match std::env::var(IGNORED_COLUMNS_ENV_VAR) {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(HashSet::new()),
+        Err(error) => {
+            return Err(Error::generic(format!(
+                "Invalid {IGNORED_COLUMNS_ENV_VAR}: {error}"
+            )));
+        }
+    };
+    ColumnName::parse_column_name_list(value)
+        .map(|columns| columns.into_iter().collect())
+        .map_err(|error| Error::generic(format!("Invalid {IGNORED_COLUMNS_ENV_VAR}: {error}")))
+}
+
+fn filter_ignored_columns(
+    schema: &mut Value,
+    ignored_columns: &HashSet<ColumnName>,
+    path: &mut Vec<String>,
+    removed_columns: &mut HashSet<ColumnName>,
+) {
+    let Some(fields) = schema.get_mut("fields").and_then(Value::as_array_mut) else {
+        return;
+    };
+
+    let mut index = 0;
+    while index < fields.len() {
+        let Some(name) = fields[index]
+            .get("name")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+        else {
+            index += 1;
+            continue;
+        };
+
+        path.push(name);
+        if ignored_columns.contains(path.as_slice()) {
+            removed_columns.insert(ColumnName::new(path.iter().cloned()));
+            fields.remove(index);
+            path.pop();
+            continue;
+        }
+
+        if let Some(data_type) = fields[index].get_mut("type") {
+            filter_ignored_columns_from_data_type(
+                data_type,
+                ignored_columns,
+                path,
+                removed_columns,
+            );
+        }
+        path.pop();
+        index += 1;
+    }
+}
+
+fn filter_ignored_columns_from_data_type(
+    data_type: &mut Value,
+    ignored_columns: &HashSet<ColumnName>,
+    path: &mut Vec<String>,
+    removed_columns: &mut HashSet<ColumnName>,
+) {
+    let Some(type_name) = data_type
+        .get("type")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+    else {
+        return;
+    };
+
+    match type_name.as_str() {
+        "struct" => filter_ignored_columns(data_type, ignored_columns, path, removed_columns),
+        "array" => {
+            if let Some(element_type) = data_type.get_mut("elementType") {
+                filter_ignored_columns_from_data_type(
+                    element_type,
+                    ignored_columns,
+                    path,
+                    removed_columns,
+                );
+            }
+        }
+        "map" => {
+            for type_key in ["keyType", "valueType"] {
+                if let Some(child_type) = data_type.get_mut(type_key) {
+                    filter_ignored_columns_from_data_type(
+                        child_type,
+                        ignored_columns,
+                        path,
+                        removed_columns,
+                    );
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1087,6 +1235,188 @@ mod tests {
     use crate::{
         Engine, EvaluationHandler, IntoEngineData, JsonHandler, ParquetHandler, StorageHandler,
     };
+
+    #[test]
+    fn filter_ignored_column_before_schema_validation() {
+        let mut schema = json!({
+            "type": "struct",
+            "fields": [
+                {
+                    "name": "foo",
+                    "type": "integer",
+                    "nullable": true,
+                    "metadata": {}
+                },
+                {
+                    "name": "Foo",
+                    "type": "string",
+                    "nullable": true,
+                    "metadata": {}
+                }
+            ]
+        });
+        let ignored = HashSet::from([ColumnName::new(["foo"])]);
+        let mut removed = HashSet::new();
+
+        filter_ignored_columns(&mut schema, &ignored, &mut Vec::new(), &mut removed);
+        let parsed: StructType = serde_json::from_value(schema).unwrap();
+
+        assert_eq!(parsed.field_names().collect::<Vec<_>>(), [&"Foo"]);
+        assert_eq!(removed, ignored);
+    }
+
+    #[test]
+    fn filter_ignored_nested_column_by_exact_path() {
+        let mut schema = json!({
+            "type": "struct",
+            "fields": [{
+                "name": "outer",
+                "type": {
+                    "type": "struct",
+                    "fields": [
+                        {
+                            "name": "value",
+                            "type": "integer",
+                            "nullable": true,
+                            "metadata": {}
+                        },
+                        {
+                            "name": "Value",
+                            "type": "string",
+                            "nullable": true,
+                            "metadata": {}
+                        }
+                    ]
+                },
+                "nullable": true,
+                "metadata": {}
+            }]
+        });
+        let ignored = HashSet::from([ColumnName::new(["outer", "value"])]);
+        let mut removed = HashSet::new();
+
+        filter_ignored_columns(&mut schema, &ignored, &mut Vec::new(), &mut removed);
+        let parsed: StructType = serde_json::from_value(schema).unwrap();
+        let outer = parsed.field("outer").unwrap();
+        let DataType::Struct(inner) = outer.data_type() else {
+            panic!("outer should remain a struct");
+        };
+
+        assert!(inner.field("value").is_none());
+        assert!(inner.field("Value").is_some());
+        assert_eq!(removed, ignored);
+    }
+
+    /// A table may carry three columns that differ only by case. Ignoring all but one lets the
+    /// schema pass the case-insensitive duplicate check.
+    #[test]
+    fn parse_schema_ignoring_resolves_three_way_case_collision() {
+        let events_attributes = json!({
+            "type": "array",
+            "elementType": {
+                "type": "map",
+                "keyType": "string",
+                "valueType": "string",
+                "valueContainsNull": true
+            },
+            "containsNull": true
+        });
+        let field = |name: &str| {
+            json!({
+                "name": name,
+                "type": events_attributes,
+                "nullable": true,
+                "metadata": {}
+            })
+        };
+        let schema_string = json!({
+            "type": "struct",
+            "fields": [
+                field("EventsAttributestring"),
+                field("EventsAttributesstring"),
+                field("EventsAttributesString"),
+            ]
+        })
+        .to_string();
+        let metadata = Metadata::new_unchecked(
+            "id",
+            None,
+            None,
+            Format::default(),
+            schema_string,
+            vec![],
+            None,
+            HashMap::new(),
+        );
+
+        // The exact value an operator sets for DELTA_KERNEL_IGNORE_COLUMNS.
+        let ignored: HashSet<ColumnName> =
+            ColumnName::parse_column_name_list("EventsAttributestring,EventsAttributesstring")
+                .unwrap()
+                .into_iter()
+                .collect();
+        let parsed = metadata.parse_schema_ignoring(&ignored).unwrap();
+
+        assert_eq!(
+            parsed.schema.field_names().collect::<Vec<_>>(),
+            [&"EventsAttributesString"]
+        );
+        assert_eq!(parsed.ignored_columns, ignored);
+    }
+
+    #[test]
+    fn parse_schema_ignoring_rejects_remaining_case_collision() {
+        let metadata = Metadata::new_unchecked(
+            "id",
+            None,
+            None,
+            Format::default(),
+            json!({
+                "type": "struct",
+                "fields": [
+                    { "name": "foo", "type": "integer", "nullable": true, "metadata": {} },
+                    { "name": "Foo", "type": "string", "nullable": true, "metadata": {} },
+                ]
+            })
+            .to_string(),
+            vec![],
+            None,
+            HashMap::new(),
+        );
+
+        let result = metadata.parse_schema_ignoring(&HashSet::new());
+
+        assert_result_error_with_message(result, "Duplicate field name (case-insensitive)");
+    }
+
+    #[test]
+    fn filtering_is_case_sensitive() {
+        let mut schema = json!({
+            "type": "struct",
+            "fields": [
+                {
+                    "name": "foo",
+                    "type": "integer",
+                    "nullable": true,
+                    "metadata": {}
+                },
+                {
+                    "name": "Foo",
+                    "type": "string",
+                    "nullable": true,
+                    "metadata": {}
+                }
+            ]
+        });
+        let ignored = HashSet::from([ColumnName::new(["FOO"])]);
+        let mut removed = HashSet::new();
+
+        filter_ignored_columns(&mut schema, &ignored, &mut Vec::new(), &mut removed);
+        let result = serde_json::from_value::<StructType>(schema);
+
+        assert!(result.is_err());
+        assert!(removed.is_empty());
+    }
 
     // duplicated
     struct ExprEngine(Arc<dyn EvaluationHandler>);

@@ -125,6 +125,7 @@ pub(crate) struct TableConfiguration {
     protocol: Protocol,
     /// Logical schema: field names are the user-facing (logical) column names.
     logical_schema: SchemaRef,
+    ignored_columns: HashSet<ColumnName>,
     physical_schemas: PhysicalSchemas,
     table_properties: TableProperties,
     column_mapping_mode: ColumnMappingMode,
@@ -159,8 +160,15 @@ impl TableConfiguration {
         table_root: Url,
         version: Version,
     ) -> DeltaResult<Self> {
-        let logical_schema = Arc::new(metadata.parse_schema()?);
-        Self::try_new_inner(metadata, protocol, table_root, version, logical_schema)
+        let parsed_schema = metadata.parse_schema_with_ignored_columns()?;
+        Self::try_new_inner(
+            metadata,
+            protocol,
+            table_root,
+            version,
+            Arc::new(parsed_schema.schema),
+            parsed_schema.ignored_columns,
+        )
     }
 
     /// Like [`try_new`](Self::try_new), but reuses `base`'s protocol, table root, and version
@@ -176,6 +184,7 @@ impl TableConfiguration {
             base.table_root.clone(),
             base.version,
             logical_schema,
+            base.ignored_columns.clone(),
         )
     }
 
@@ -185,7 +194,20 @@ impl TableConfiguration {
         table_root: Url,
         version: Version,
         logical_schema: SchemaRef,
+        ignored_columns: HashSet<ColumnName>,
     ) -> DeltaResult<Self> {
+        if let Some(column) = ignored_columns.iter().find(|column| {
+            column.path().len() == 1
+                && metadata
+                    .partition_columns()
+                    .iter()
+                    .any(|partition| partition == &column.path()[0])
+        }) {
+            return Err(Error::unsupported(format!(
+                "Cannot ignore partition column '{column}'"
+            )));
+        }
+
         let table_properties = metadata.parse_table_properties();
         let column_mapping_mode = column_mapping_mode(&protocol, &table_properties);
 
@@ -194,6 +216,7 @@ impl TableConfiguration {
 
         let table_config = Self {
             logical_schema,
+            ignored_columns,
             physical_schemas,
             metadata,
             protocol,
@@ -471,6 +494,10 @@ impl TableConfiguration {
         self.logical_schema.clone()
     }
 
+    pub(crate) fn ignored_columns(&self) -> &HashSet<ColumnName> {
+        &self.ignored_columns
+    }
+
     /// The physical schema ([`SchemaRef`]) of this table at this version.
     ///
     /// When column mapping is disabled, this is identical to
@@ -702,6 +729,13 @@ impl TableConfiguration {
 
     /// Internal helper for write operations
     fn ensure_write_supported(&self) -> DeltaResult<()> {
+        if !self.ignored_columns.is_empty() {
+            return Err(Error::unsupported(format!(
+                "Writes are disabled because columns were ignored through {}",
+                crate::actions::IGNORED_COLUMNS_ENV_VAR
+            )));
+        }
+
         // Version check: kernel supports writer versions
         // MIN_VALID_RW_VERSION..=MAX_VALID_WRITER_VERSION
         require!(
@@ -905,7 +939,7 @@ impl TableConfiguration {
 #[cfg(test)]
 mod test {
 
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
 
     use rstest::rstest;
@@ -999,6 +1033,54 @@ mod test {
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
         TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap()
+    }
+
+    #[test]
+    fn ignored_columns_allow_reads_but_disable_writes() {
+        let mut config = create_mock_table_config(&[], &[]);
+        config
+            .ignored_columns
+            .insert(ColumnName::new(["ignored_value"]));
+
+        assert!(config.ensure_operation_supported(Operation::Scan).is_ok());
+        assert_result_error_with_message(
+            config.ensure_operation_supported(Operation::Write),
+            "Writes are disabled because columns were ignored",
+        );
+    }
+
+    #[test]
+    fn partition_columns_cannot_be_ignored() {
+        let original_schema = Arc::new(StructType::new_unchecked([
+            StructField::nullable("part", DataType::STRING),
+            StructField::nullable("value", DataType::INTEGER),
+        ]));
+        let filtered_schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+            "value",
+            DataType::INTEGER,
+        )]));
+        let metadata = Metadata::try_new(
+            None,
+            None,
+            original_schema,
+            vec!["part".to_string()],
+            0,
+            HashMap::new(),
+        )
+        .unwrap();
+        let protocol =
+            Protocol::try_new(1, 2, None::<[TableFeature; 0]>, None::<[TableFeature; 0]>).unwrap();
+
+        let result = TableConfiguration::try_new_inner(
+            metadata,
+            protocol,
+            Url::try_from("file:///").unwrap(),
+            0,
+            filtered_schema,
+            HashSet::from([ColumnName::new(["part"])]),
+        );
+
+        assert_result_error_with_message(result, "Cannot ignore partition column 'part'");
     }
 
     #[test]
