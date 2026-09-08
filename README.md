@@ -51,9 +51,10 @@ DELTA_KERNEL_IGNORE_COLUMNS='events.foo'
 
 Configured columns are removed from the table schema before validation. Backticks support field
 names containing dots, commas, or spaces. Kernel rejects ignored partition columns, references to
-ignored columns in scan projections or predicates, and all writes while any table columns are
-ignored. This is a compatibility override for reading an invalid Delta schema; it does not modify
-the table or its files.
+ignored columns in scan projections or predicates, and CREATE TABLE / ALTER TABLE while any columns
+are ignored. Blind appends are allowed because they do not rewrite table metadata. Do not enable
+schema evolution (`SchemaMode::Merge`) in the writer while this override is active. This is a
+compatibility override; it does not modify the table or its files.
 
 In general, you will want to depend on `delta-kernel-rs` by adding it as a dependency to your
 `Cargo.toml`, (that is, for rust projects using cargo) for other projects please see the [FFI]

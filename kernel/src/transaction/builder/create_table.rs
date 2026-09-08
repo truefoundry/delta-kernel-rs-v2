@@ -989,6 +989,10 @@ impl CreateTableTransactionBuilder {
 
         // Build TableConfiguration directly for the new table
         let table_configuration = TableConfiguration::try_new(metadata, protocol, table_url, 0)?;
+        // CREATE TABLE emits `metaData` from this configuration. If ignore-columns stripped
+        // fields from the user schema, committing would persist a filtered (or still-invalid)
+        // schema. Reject rather than creating the table under the override.
+        table_configuration.ensure_schema_mutations_supported()?;
 
         // Create Transaction<CreateTable> with the effective table configuration
         Transaction::try_new_create_table(
