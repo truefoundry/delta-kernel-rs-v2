@@ -178,6 +178,9 @@ impl TableConfiguration {
         metadata: Metadata,
         logical_schema: SchemaRef,
     ) -> DeltaResult<Self> {
+        // ALTER TABLE builds the next `metaData` from `logical_schema`. That schema is the
+        // filtered view when columns are ignored, so committing it would drop those columns.
+        base.ensure_schema_mutations_supported()?;
         Self::try_new_inner(
             metadata,
             base.protocol.clone(),
@@ -498,6 +501,21 @@ impl TableConfiguration {
         &self.ignored_columns
     }
 
+    /// Rejects CREATE TABLE and ALTER TABLE while columns are being ignored.
+    ///
+    /// Appends are allowed: they emit add/remove file actions without rewriting `metaData`, so the
+    /// filtered schema cannot leak into the log. Schema mutations would persist the filtered schema
+    /// (or a schema derived from it) and drop ignored columns from the table.
+    pub(crate) fn ensure_schema_mutations_supported(&self) -> DeltaResult<()> {
+        if !self.ignored_columns.is_empty() {
+            return Err(Error::unsupported(format!(
+                "CREATE TABLE and ALTER TABLE are disabled because columns were ignored through {}",
+                crate::actions::IGNORED_COLUMNS_ENV_VAR
+            )));
+        }
+        Ok(())
+    }
+
     /// The physical schema ([`SchemaRef`]) of this table at this version.
     ///
     /// When column mapping is disabled, this is identical to
@@ -729,13 +747,6 @@ impl TableConfiguration {
 
     /// Internal helper for write operations
     fn ensure_write_supported(&self) -> DeltaResult<()> {
-        if !self.ignored_columns.is_empty() {
-            return Err(Error::unsupported(format!(
-                "Writes are disabled because columns were ignored through {}",
-                crate::actions::IGNORED_COLUMNS_ENV_VAR
-            )));
-        }
-
         // Version check: kernel supports writer versions
         // MIN_VALID_RW_VERSION..=MAX_VALID_WRITER_VERSION
         require!(
@@ -1036,16 +1047,25 @@ mod test {
     }
 
     #[test]
-    fn ignored_columns_allow_reads_but_disable_writes() {
+    fn ignored_columns_allow_reads_and_appends_but_block_schema_changes() {
         let mut config = create_mock_table_config(&[], &[]);
         config
             .ignored_columns
             .insert(ColumnName::new(["ignored_value"]));
 
         assert!(config.ensure_operation_supported(Operation::Scan).is_ok());
+        assert!(config.ensure_operation_supported(Operation::Write).is_ok());
         assert_result_error_with_message(
-            config.ensure_operation_supported(Operation::Write),
-            "Writes are disabled because columns were ignored",
+            config.ensure_schema_mutations_supported(),
+            "CREATE TABLE and ALTER TABLE are disabled because columns were ignored",
+        );
+        assert_result_error_with_message(
+            TableConfiguration::try_new_with_schema(
+                &config,
+                config.metadata().clone(),
+                config.logical_schema(),
+            ),
+            "CREATE TABLE and ALTER TABLE are disabled because columns were ignored",
         );
     }
 
