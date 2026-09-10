@@ -1489,3 +1489,45 @@ fn test_create_many_nested_struct() {
     .unwrap();
     assert_create_many(&[row1, row2], schema, expected);
 }
+
+// === LargeUtf8 / LargeBinary scalar builder support ===
+//
+// When DELTA_KERNEL_PREFER_LARGE_VARLEN is set, try_from_kernel maps String/Binary to
+// LargeUtf8/LargeBinary and make_builder creates Large* builders. append_to / append_null
+// must accept those builders (not only the standard Utf8/Binary ones).
+
+#[test]
+fn test_append_string_and_null_to_large_string_builder() {
+    let mut builder = array::make_builder(&DataType::LargeUtf8, 3);
+    Scalar::String("hello".into())
+        .append_to(builder.as_mut(), 2)
+        .unwrap();
+    Scalar::append_null(builder.as_mut(), &KernelDataType::STRING, 1).unwrap();
+    let arr = builder.finish();
+    assert_eq!(arr.data_type(), &DataType::LargeUtf8);
+    let arr = arr
+        .as_any()
+        .downcast_ref::<GenericStringArray<i64>>()
+        .unwrap();
+    assert_eq!(arr.value(0), "hello");
+    assert_eq!(arr.value(1), "hello");
+    assert!(arr.is_null(2));
+}
+
+#[test]
+fn test_append_binary_and_null_to_large_binary_builder() {
+    let mut builder = array::make_builder(&DataType::LargeBinary, 3);
+    Scalar::Binary(b"abc".to_vec())
+        .append_to(builder.as_mut(), 2)
+        .unwrap();
+    Scalar::append_null(builder.as_mut(), &KernelDataType::BINARY, 1).unwrap();
+    let arr = builder.finish();
+    assert_eq!(arr.data_type(), &DataType::LargeBinary);
+    let arr = arr
+        .as_any()
+        .downcast_ref::<crate::arrow::array::LargeBinaryArray>()
+        .unwrap();
+    assert_eq!(arr.value(0), b"abc");
+    assert_eq!(arr.value(1), b"abc");
+    assert!(arr.is_null(2));
+}
