@@ -339,10 +339,26 @@ impl TryFromKernel<&MapType> for ArrowField {
 
 impl TryFromKernel<&DataType> for ArrowDataType {
     fn try_from_kernel(t: &DataType) -> Result<Self, ArrowError> {
+
+        // Scoped changes: Just for deltafusion compaction
+        // set env var DELTA_KERNEL_PREFER_LARGE_VARLEN to true to prefer large varlen types
+        // for deltafusion compaction, by default we prefer default varlen types.
+
+        let mut arrow_string_type = ArrowDataType::Utf8;
+        let mut arrow_binary_type = ArrowDataType::Binary;
+
+        let prefer_large_varlen = std::env::var("DELTA_KERNEL_PREFER_LARGE_VARLEN")
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if prefer_large_varlen {
+            arrow_string_type = ArrowDataType::LargeUtf8;
+            arrow_binary_type = ArrowDataType::LargeBinary;
+        }
+
         match t {
             DataType::Primitive(p) => {
                 match p {
-                    PrimitiveType::String => Ok(ArrowDataType::Utf8),
+                    PrimitiveType::String => Ok(arrow_string_type),
                     PrimitiveType::Long => Ok(ArrowDataType::Int64), // undocumented type
                     PrimitiveType::Integer => Ok(ArrowDataType::Int32),
                     PrimitiveType::Short => Ok(ArrowDataType::Int16),
@@ -350,7 +366,7 @@ impl TryFromKernel<&DataType> for ArrowDataType {
                     PrimitiveType::Float => Ok(ArrowDataType::Float32),
                     PrimitiveType::Double => Ok(ArrowDataType::Float64),
                     PrimitiveType::Boolean => Ok(ArrowDataType::Boolean),
-                    PrimitiveType::Binary => Ok(ArrowDataType::Binary),
+                    PrimitiveType::Binary => Ok(arrow_binary_type),
                     PrimitiveType::Decimal(dtype) => Ok(ArrowDataType::Decimal128(
                         dtype.precision(),
                         dtype.scale() as i8, // 0..=38

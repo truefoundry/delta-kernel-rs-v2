@@ -25,6 +25,7 @@ use crate::arrow::error::ArrowError;
 use crate::arrow::json::writer::{make_encoder, EncoderOptions};
 use crate::arrow::json::StructMode;
 use crate::engine::arrow_conversion::{TryFromKernel, TryIntoArrow};
+use crate::engine::arrow_data::as_string_accessor;
 use crate::engine::arrow_expression::opaque::{
     ArrowOpaqueExpressionOpAdaptor, ArrowOpaquePredicateOpAdaptor,
 };
@@ -799,15 +800,9 @@ fn evaluate_map_to_struct(
         .downcast_ref::<MapArray>()
         .ok_or_else(|| Error::generic("MapToStruct requires a MapArray as input"))?;
 
-    let map_keys = map_array
-        .keys()
-        .as_any()
-        .downcast_ref::<StringArray>()
+    let map_keys = as_string_accessor(map_array.keys().as_ref())
         .ok_or_else(|| Error::generic("MapToStruct requires maps with string keys"))?;
-    let map_values = map_array
-        .values()
-        .as_any()
-        .downcast_ref::<StringArray>()
+    let map_values = as_string_accessor(map_array.values().as_ref())
         .ok_or_else(|| Error::generic("MapToStruct requires maps with string values"))?;
 
     let num_rows = map_array.len();
@@ -2060,11 +2055,7 @@ mod tests {
         let result = evaluate_expression(&expr, &batch, Some(&result_type)).unwrap();
         let structs = result.as_any().downcast_ref::<StructArray>().unwrap();
 
-        let regions = structs
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
+        let regions = as_string_accessor(structs.column(0).as_ref()).unwrap();
         let ids = structs
             .column(1)
             .as_any()
@@ -2087,7 +2078,7 @@ mod tests {
         assert!(dates.is_null(1));
 
         // Row 2: null map → all null
-        assert!(regions.is_null(2));
+        assert!(!regions.is_valid(2));
         assert!(ids.is_null(2));
         assert!(dates.is_null(2));
     }
@@ -2101,14 +2092,10 @@ mod tests {
         let expr = Expr::map_to_struct(column_expr!("pv"));
         let result = evaluate_expression(&expr, &batch, Some(&result_type)).unwrap();
         let structs = result.as_any().downcast_ref::<StructArray>().unwrap();
-        let col = structs
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        assert!(col.is_null(0));
-        assert!(col.is_null(1));
-        assert!(col.is_null(2));
+        let col = as_string_accessor(structs.column(0).as_ref()).unwrap();
+        assert!(!col.is_valid(0));
+        assert!(!col.is_valid(1));
+        assert!(!col.is_valid(2));
     }
 
     #[test]
@@ -2157,11 +2144,7 @@ mod tests {
         let expr = Expr::map_to_struct(column_expr!("pv"));
         let result = evaluate_expression(&expr, &batch, Some(&result_type)).unwrap();
         let structs = result.as_any().downcast_ref::<StructArray>().unwrap();
-        let col = structs
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
+        let col = as_string_accessor(structs.column(0).as_ref()).unwrap();
         // Rightmost entry wins
         assert_eq!(col.value(0), "last");
     }
@@ -2270,6 +2253,38 @@ mod tests {
         let expr = Expr::map_to_struct(column_expr!("s"));
         let result = evaluate_expression(&expr, &batch, Some(&result_type));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_map_to_struct_large_utf8_keys_and_values() {
+        use crate::arrow::array::LargeStringBuilder;
+
+        let mut builder =
+            MapBuilder::new(None, LargeStringBuilder::new(), LargeStringBuilder::new());
+        builder.keys().append_value("region");
+        builder.values().append_value("us");
+        builder.append(true).unwrap();
+        builder.keys().append_value("region");
+        builder.values().append_value("eu");
+        builder.append(true).unwrap();
+        let map_array = builder.finish();
+
+        let schema = ArrowSchema::new(vec![ArrowField::new(
+            "pv",
+            map_array.data_type().clone(),
+            true,
+        )]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(map_array)]).unwrap();
+
+        let output_schema =
+            StructType::new_unchecked(vec![StructField::nullable("region", DataType::STRING)]);
+        let result_type = DataType::Struct(Box::new(output_schema));
+        let expr = Expr::map_to_struct(column_expr!("pv"));
+        let result = evaluate_expression(&expr, &batch, Some(&result_type)).unwrap();
+        let structs = result.as_any().downcast_ref::<StructArray>().unwrap();
+        let regions = as_string_accessor(structs.column(0).as_ref()).unwrap();
+        assert_eq!(regions.value(0), "us");
+        assert_eq!(regions.value(1), "eu");
     }
 
     /// Helper to build a batch with Int32 column `a` and a Boolean column `is_valid`.
