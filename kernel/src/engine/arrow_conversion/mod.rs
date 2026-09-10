@@ -347,8 +347,10 @@ impl TryFromKernel<&DataType> for ArrowDataType {
         let mut arrow_string_type = ArrowDataType::Utf8;
         let mut arrow_binary_type = ArrowDataType::Binary;
 
-        // Doesnt matter if env var is true or false, I am only checking if it is set or not.
-        if std::env::var("DELTA_KERNEL_PREFER_LARGE_VARLEN").is_ok() {
+        let prefer_large_varlen = std::env::var("DELTA_KERNEL_PREFER_LARGE_VARLEN")
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if prefer_large_varlen {
             arrow_string_type = ArrowDataType::LargeUtf8;
             arrow_binary_type = ArrowDataType::LargeBinary;
         }
