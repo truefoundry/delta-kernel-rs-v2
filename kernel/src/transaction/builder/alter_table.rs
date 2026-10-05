@@ -180,6 +180,10 @@ impl AlterTableTransactionBuilder<Modifying> {
                 "ALTER TABLE is not yet supported on tables with allowColumnDefaults enabled",
             ));
         }
+        // ALTER TABLE derives the next schema from `logical_schema`, which is filtered when
+        // columns are ignored. Reject before applying operations so the filtered schema cannot
+        // be committed.
+        table_config.ensure_schema_mutations_supported()?;
         // Rejects writes to tables kernel can't safely commit to: writer version out of
         // kernel's supported range, unsupported writer features, or schemas with SQL-expression
         // invariants. Runs on the pre-alter snapshot; future ALTER variants that change the

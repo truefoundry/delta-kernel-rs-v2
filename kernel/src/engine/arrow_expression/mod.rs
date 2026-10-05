@@ -76,13 +76,24 @@ impl Scalar {
             }};
         }
 
-        // Use append_value in a loop for builders without batch append (String, Binary)
-        // TODO: Remove after https://github.com/apache/arrow-rs/pull/9426 gets in
-        macro_rules! append_val_as {
-            ($t:ty, $val:expr) => {{
-                let builder = builder_as!($t);
-                for _ in 0..num_rows {
-                    builder.append_value($val);
+        // Utf8/Binary may be standard or Large depending on DELTA_KERNEL_PREFER_LARGE_VARLEN.
+        // `make_builder` creates the matching builder; try both concrete types.
+        // TODO: Use append_value_n after https://github.com/apache/arrow-rs/pull/9426 gets in
+        macro_rules! append_val_as_varlen {
+            ($std:ty, $large:ty, $val:expr) => {{
+                if let Some(builder) = builder.as_any_mut().downcast_mut::<$std>() {
+                    for _ in 0..num_rows {
+                        builder.append_value($val);
+                    }
+                } else if let Some(builder) = builder.as_any_mut().downcast_mut::<$large>() {
+                    for _ in 0..num_rows {
+                        builder.append_value($val);
+                    }
+                } else {
+                    return Err(Error::invalid_expression(format!(
+                        "Invalid builder for {}",
+                        self.data_type()
+                    )));
                 }
             }};
         }
@@ -94,7 +105,9 @@ impl Scalar {
             Byte(val) => append_val_n_as!(array::Int8Builder, *val),
             Float(val) => append_val_n_as!(array::Float32Builder, *val),
             Double(val) => append_val_n_as!(array::Float64Builder, *val),
-            String(val) => append_val_as!(array::StringBuilder, val),
+            String(val) => {
+                append_val_as_varlen!(array::StringBuilder, array::LargeStringBuilder, val)
+            }
             Boolean(val) => builder_as!(array::BooleanBuilder).append_n(num_rows, *val),
             Timestamp(val) | TimestampNtz(val) => {
                 // timezone was already set at builder construction time
@@ -108,7 +121,9 @@ impl Scalar {
                 append_val_n_as!(array::TimestampNanosecondBuilder, *val)
             }
             Date(val) => append_val_n_as!(array::Date32Builder, *val),
-            Binary(val) => append_val_as!(array::BinaryBuilder, val),
+            Binary(val) => {
+                append_val_as_varlen!(array::BinaryBuilder, array::LargeBinaryBuilder, val)
+            }
             // precision and scale were already set at builder construction time
             Decimal(val) => append_val_n_as!(array::Decimal128Builder, val.bits()),
             Struct(data) => {
@@ -173,6 +188,21 @@ impl Scalar {
             }};
         }
 
+        // Utf8/Binary may be standard or Large depending on DELTA_KERNEL_PREFER_LARGE_VARLEN.
+        macro_rules! append_nulls_as_varlen {
+            ($std:ty, $large:ty) => {{
+                if let Some(builder) = builder.as_any_mut().downcast_mut::<$std>() {
+                    builder.append_nulls(num_rows);
+                } else if let Some(builder) = builder.as_any_mut().downcast_mut::<$large>() {
+                    builder.append_nulls(num_rows);
+                } else {
+                    return Err(Error::invalid_expression(format!(
+                        "Invalid builder for {data_type}"
+                    )));
+                }
+            }};
+        }
+
         match *data_type {
             DataType::INTEGER => append_nulls_as!(array::Int32Builder),
             DataType::LONG => append_nulls_as!(array::Int64Builder),
@@ -180,7 +210,9 @@ impl Scalar {
             DataType::BYTE => append_nulls_as!(array::Int8Builder),
             DataType::FLOAT => append_nulls_as!(array::Float32Builder),
             DataType::DOUBLE => append_nulls_as!(array::Float64Builder),
-            DataType::STRING => append_nulls_as!(array::StringBuilder),
+            DataType::STRING => {
+                append_nulls_as_varlen!(array::StringBuilder, array::LargeStringBuilder)
+            }
             DataType::BOOLEAN => append_nulls_as!(array::BooleanBuilder),
             DataType::TIMESTAMP | DataType::TIMESTAMP_NTZ => {
                 append_nulls_as!(array::TimestampMicrosecondBuilder)
@@ -190,7 +222,9 @@ impl Scalar {
                 append_nulls_as!(array::TimestampNanosecondBuilder)
             }
             DataType::DATE => append_nulls_as!(array::Date32Builder),
-            DataType::BINARY => append_nulls_as!(array::BinaryBuilder),
+            DataType::BINARY => {
+                append_nulls_as_varlen!(array::BinaryBuilder, array::LargeBinaryBuilder)
+            }
             DataType::Primitive(PrimitiveType::Decimal(_)) => {
                 append_nulls_as!(array::Decimal128Builder)
             }
