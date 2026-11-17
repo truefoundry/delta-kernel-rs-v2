@@ -719,6 +719,105 @@ fn test_scan_metadata_from_with_update() {
     assert_eq!(new_files[1].num_rows(), 3);
 }
 
+/// Seeded replay must cache the seed's parsed stats on the snapshot and reuse them, so a
+/// warm query against an unchanged snapshot version pays no per-scan JSON stats parsing.
+///
+/// The first replay parses the seed's raw JSON stats and populates the snapshot cache. The
+/// second replay feeds seed rows whose raw JSON `stats` are garbage: the cached parsed
+/// stats must still produce correct output. Without the cache the second replay would try
+/// to parse the garbage JSON and fail.
+#[test_log::test]
+fn test_scan_metadata_from_reuses_cached_parsed_stats() {
+    let path =
+        std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/")).unwrap();
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = Arc::new(SyncEngine::new());
+
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+    let version = snapshot.version();
+
+    // Build the seed exactly as an engine-side cache feeds it: scan-row batches with raw
+    // JSON stats and no parsed columns (the default scan strips parsed columns).
+    let materialize_scan = snapshot
+        .clone()
+        .scan_builder()
+        .build()
+        .unwrap();
+    let seed_batches: Vec<RecordBatch> = materialize_scan
+        .scan_metadata(engine.as_ref())
+        .unwrap()
+        .map_ok(|ScanMetadata { scan_files, .. }| {
+            let (underlying_data, selection_vector) = scan_files.into_parts();
+            let batch: RecordBatch = ArrowEngineData::try_from_engine_data(underlying_data)
+                .unwrap()
+                .into();
+            filter_record_batch(&batch, &BooleanArray::from(selection_vector)).unwrap()
+        })
+        .try_collect()
+        .unwrap();
+    assert_eq!(seed_batches.len(), 1);
+
+    let replay = |seed: Vec<Box<dyn EngineData>>| {
+        let scan = snapshot
+            .clone()
+            .scan_builder()
+            .with_stats(StatsOptions::all())
+            .build()
+            .unwrap();
+        let replayed: Vec<RecordBatch> = scan
+            .scan_metadata_from(engine.as_ref(), version, seed, None)
+            .unwrap()
+            .map_ok(|ScanMetadata { scan_files, .. }| {
+                let (underlying_data, selection_vector) = scan_files.into_parts();
+                let batch: RecordBatch = ArrowEngineData::try_from_engine_data(underlying_data)
+                    .unwrap()
+                    .into();
+                filter_record_batch(&batch, &BooleanArray::from(selection_vector)).unwrap()
+            })
+            .try_collect()
+            .unwrap();
+        assert_eq!(replayed.len(), 1);
+        replayed
+            .into_iter()
+            .next()
+            .unwrap()
+            .column_by_name(STATS_PARSED)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap()
+            .column_by_name(NUM_RECORDS)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values()
+            .to_vec()
+    };
+
+    // First warm query: parses the raw stats once and populates the snapshot cache.
+    let first: Vec<Box<dyn EngineData>> = seed_batches
+        .iter()
+        .cloned()
+        .map(|batch| Box::new(ArrowEngineData::from(batch)) as Box<dyn EngineData>)
+        .collect();
+    assert_eq!(replay(first), [10]);
+
+    // Second warm query: seed rows carry garbage raw JSON stats. The cached parsed stats
+    // must win; without the cache the parse would fail.
+    let batch = &seed_batches[0];
+    let stats_idx = batch.schema().index_of("stats").unwrap();
+    let fields = batch.schema().fields().clone();
+    let mut columns: Vec<_> = batch.columns().to_vec();
+    columns[stats_idx] =
+        Arc::new(StringArray::from(vec!["{not json"; batch.num_rows()])) as _;
+    let garbage_batch =
+        RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), columns).unwrap();
+    let second: Vec<Box<dyn EngineData>> =
+        vec![Box::new(ArrowEngineData::from(garbage_batch))];
+    assert_eq!(replay(second), [10]);
+}
+
 #[test]
 fn test_get_partition_value() {
     let cases = [

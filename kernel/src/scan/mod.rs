@@ -12,11 +12,18 @@ use url::Url;
 
 use self::data_skipping::as_checkpoint_skipping_predicate;
 use self::log_replay::{get_scan_metadata_transform_expr, scan_action_iter};
+#[cfg(any(feature = "arrow-58", feature = "arrow-59"))]
+use self::log_replay::{
+    get_scan_metadata_transform_expr_with_parsed, restored_add_schema_with_parsed,
+    scan_row_schema_with_parsed_columns,
+};
 use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
 };
 use crate::actions::{Add, ADD_FIELD, ADD_NAME, NULL_COUNT, REMOVE_FIELD};
 use crate::cancellation::{CancellableIterator, CancellationTokenRef};
+#[cfg(any(feature = "arrow-58", feature = "arrow-59"))]
+use crate::arrow::array::ArrayRef;
 #[cfg(feature = "declarative-plans")]
 use crate::checkpoint::CheckpointShape;
 use crate::engine_data::FilteredEngineData;
@@ -630,6 +637,21 @@ pub fn get_transform_for_row(
     transforms.get(row).cloned().flatten()
 }
 
+/// Parsed seed stats cached on a [`Snapshot`] for the seeded replay path.
+///
+/// The seed (cached scan-file state an engine keeps per snapshot version) arrives as
+/// scan-row batches whose raw JSON `stats` were already parsed once when the seed was
+/// materialized. This cache stores those parsed stats so warm queries against an
+/// unchanged snapshot reuse them instead of re-parsing the raw JSON on every scan
+/// (see delta-io/delta-kernel-rs#3307).
+#[cfg(any(feature = "arrow-58", feature = "arrow-59"))]
+#[derive(Debug)]
+pub(crate) struct SeedParsedStats {
+    /// Parsed `stats_parsed` struct column per seed batch, row-aligned with the seed
+    /// batches fed to [`crate::scan::Scan::scan_metadata_from`] for this snapshot.
+    batches: Vec<ArrayRef>,
+}
+
 /// [`ScanMetadata`] contains (1) a batch of [`FilteredEngineData`] specifying data files to be
 /// scanned and (2) a vector of transforms (one transform per scan file) that must be applied to the
 /// data read from those files.
@@ -925,27 +947,32 @@ impl Scan {
             )));
         }
 
-        // in order to be processed by our log replay, we must re-shape the existing scan metadata
-        // back into shape as we read it from the log. Since it is already reconciled data,
-        // we treat it as if it originated from a checkpoint.
-        let transform = engine.evaluation_handler().new_expression_evaluator(
-            scan_row_schema(),
-            get_scan_metadata_transform_expr(),
-            restored_add_schema().clone().into(),
-        )?;
-        let apply_transform = move |data: Box<dyn EngineData>| {
-            Ok(ActionsBatch::new(transform.evaluate(data.as_ref())?, false))
-        };
-
-        let log_segment = self.snapshot.log_segment();
+        let existing_batches: Vec<Box<dyn EngineData>> = existing_data.into_iter().collect();
 
         // If the snapshot version corresponds to the hint version, we process the existing data
-        // to apply file skipping and provide the required transformations.
-        // Since we're only processing existing data (no checkpoint), we use the base schema
-        // and no stats_parsed optimization.
+        // to apply file skipping and provide the required transformations. When the seed's raw
+        // JSON stats have already been parsed for this snapshot, replay reads the cached
+        // parsed stats instead of re-parsing them on every scan.
         if existing_version == self.snapshot.version() {
+            #[cfg(any(feature = "arrow-58", feature = "arrow-59"))]
+            if let Ok(stream) =
+                self.seeded_replay_reusing_parsed_stats(engine, &existing_batches)
+            {
+                return Ok(stream);
+            }
+
+            // Legacy path: reshape with the static transform; replay re-parses raw JSON
+            // stats for every seed row on every scan.
+            let transform = engine.evaluation_handler().new_expression_evaluator(
+                scan_row_schema(),
+                get_scan_metadata_transform_expr(),
+                restored_add_schema().clone().into(),
+            )?;
+            let apply_transform = move |data: Box<dyn EngineData>| {
+                Ok(ActionsBatch::new(transform.evaluate(data.as_ref())?, false))
+            };
             let actions_with_checkpoint_info = ActionsWithCheckpointInfo {
-                actions: existing_data.into_iter().map(apply_transform),
+                actions: existing_batches.into_iter().map(apply_transform),
                 checkpoint_info: CheckpointReadInfo {
                     has_stats_parsed: false,
                     has_partition_values_parsed: false,
@@ -956,6 +983,21 @@ impl Scan {
                 self.scan_metadata_inner(engine, actions_with_checkpoint_info)?,
             ));
         }
+
+        // The incremental path does not cache parsed stats from the seed: the merged
+        // stream's stats handling is driven by the newly-read actions, so seed rows fall
+        // back to raw JSON stats. Re-shape the existing scan metadata back into shape as
+        // we read it from the log; since it is already reconciled data, we treat it as if
+        // it originated from a checkpoint.
+        let log_segment = self.snapshot.log_segment();
+        let transform = engine.evaluation_handler().new_expression_evaluator(
+            scan_row_schema(),
+            get_scan_metadata_transform_expr(),
+            restored_add_schema().clone().into(),
+        )?;
+        let apply_transform = move |data: Box<dyn EngineData>| {
+            Ok(ActionsBatch::new(transform.evaluate(data.as_ref())?, false))
+        };
 
         // If the current log segment contains a checkpoint newer than the hint version
         // we disregard the existing data hint, and perform a full scan. The current log segment
@@ -1000,10 +1042,179 @@ impl Scan {
         let actions_with_checkpoint_info = ActionsWithCheckpointInfo {
             actions: result
                 .actions
-                .chain(existing_data.into_iter().map(apply_transform)),
+                .chain(existing_batches.into_iter().map(apply_transform)),
             checkpoint_info: result.checkpoint_info,
         };
 
+        Ok(Box::new(self.scan_metadata_inner(
+            engine,
+            actions_with_checkpoint_info,
+        )?))
+    }
+
+    /// Seeded replay that reuses parsed stats cached on the snapshot.
+    ///
+    /// The seed arrives as scan-row batches whose raw JSON `stats` were already parsed once
+    /// when the seed was materialized. This path parses them once per snapshot version
+    /// (populating the snapshot's cache), splices the parsed `stats_parsed` column back onto
+    /// the seed rows, and lets log replay read it directly — so warm queries against an
+    /// unchanged snapshot pay no per-scan JSON stats parsing cost
+    /// (see delta-io/delta-kernel-rs#3307).
+    ///
+    /// Returns `Err` when the fast path does not apply (non-Arrow seed data, scans that
+    /// request no stats, or incompatible cached stats); the caller then falls back to the
+    /// legacy transform, which re-parses raw JSON stats.
+    #[cfg(any(feature = "arrow-58", feature = "arrow-59"))]
+    fn seeded_replay_reusing_parsed_stats(
+        &self,
+        engine: &dyn Engine,
+        existing_batches: &[Box<dyn EngineData>],
+    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ScanMetadata>>>> {
+        use crate::arrow::array::{Array as _, ArrayRef, RecordBatch, StructArray};
+        use crate::arrow::datatypes::{Field as ArrowField, Schema as ArrowSchema};
+        use crate::engine::arrow_data::ArrowEngineData;
+        use crate::expressions::{col, Expression};
+        use crate::schema::StructField;
+
+        let requested_stats = match self.state_info.physical_stats_schema.clone() {
+            Some(requested) => requested,
+            None => return Err(Error::generic("scan requests no stats; nothing to reuse")),
+        };
+
+        // Downcast the seed to Arrow without consuming it; anything else falls back to the
+        // legacy path.
+        let seed: Vec<RecordBatch> = existing_batches
+            .iter()
+            .map(|data| {
+                data.any_ref()
+                    .downcast_ref::<ArrowEngineData>()
+                    .map(|data| data.record_batch().clone())
+                    .ok_or_else(|| Error::generic("seed data is not ArrowEngineData"))
+            })
+            .try_collect()?;
+
+        // The stats schema the once-per-snapshot parse targets: the table's full expected
+        // stats schema, from which every scan projects its requested subset.
+        let full_stats = self
+            .snapshot
+            .table_configuration()
+            .build_expected_stats_schemas(None, None)?
+            .physical;
+
+        // Cache lookup; on a miss (or seed-shape drift), parse the raw JSON stats once via
+        // the engine and populate the cache. Same snapshot version means the same
+        // materialized seed, so row alignment is expected; the length guards turn any
+        // violation into a re-parse instead of a wrong splice.
+        let parsed: Vec<ArrayRef> = {
+            let mut cache = self
+                .snapshot
+                .parsed_seed_stats
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match cache.as_ref() {
+                Some(entry)
+                    if entry.batches.len() == seed.len()
+                        && entry
+                            .batches
+                            .iter()
+                            .zip(&seed)
+                            .all(|(parsed, batch)| parsed.len() == batch.num_rows()) =>
+                {
+                    entry.batches.clone()
+                }
+                _ => {
+                    let stats_input_schema: SchemaRef = Arc::new(StructType::try_new([
+                        StructField::nullable("stats", DataType::STRING),
+                    ])?);
+                    let parse_eval = engine.evaluation_handler().new_expression_evaluator(
+                        stats_input_schema,
+                        Arc::new(Expression::parse_json(
+                            col!("stats"),
+                            full_stats.clone(),
+                        )),
+                        full_stats.clone().into(),
+                    )?;
+                    let mut parsed = Vec::with_capacity(seed.len());
+                    for batch in &seed {
+                        let stats_idx = batch
+                            .schema()
+                            .index_of("stats")
+                            .ok()
+                            .ok_or_else(|| {
+                                Error::generic("seed row has no stats column")
+                            })?;
+                        let stats_batch = batch.project(&[stats_idx])?;
+                        let out = parse_eval.evaluate(&ArrowEngineData::new(stats_batch))?;
+                        let out_batch: RecordBatch = ArrowEngineData::try_from_engine_data(out)?
+                            .into();
+                        // The evaluator flattens struct output into top-level columns;
+                        // re-wrap them as the single `stats_parsed` struct column.
+                        let struct_array = StructArray::from(out_batch);
+                        parsed.push(Arc::new(struct_array) as ArrayRef);
+                    }
+                    *cache = Some(SeedParsedStats { batches: parsed.clone() });
+                    parsed
+                }
+            }
+        };
+
+        // Same validation the checkpoint read path applies to real checkpoint batches,
+        // against a synthetic checkpoint schema shaped like the spliced seed.
+        let seed_add_schema = restored_add_schema_with_parsed(Some(&full_stats), None)?;
+        if !LogSegment::schema_has_compatible_stats_parsed(
+            seed_add_schema.as_ref(),
+            requested_stats.as_ref(),
+        ) {
+            return Err(Error::generic(
+                "cached parsed stats incompatible with the scan's requested stats schema",
+            ));
+        }
+
+        let input_schema =
+            scan_row_schema_with_parsed_columns(Some(full_stats.clone()), None)?;
+        let output_schema = restored_add_schema_with_parsed(Some(&requested_stats), None)?;
+        let transform = engine.evaluation_handler().new_expression_evaluator(
+            input_schema,
+            get_scan_metadata_transform_expr_with_parsed(
+                Some(&full_stats),
+                None,
+                Some(&requested_stats),
+                None,
+            ),
+            output_schema.clone().into(),
+        )?;
+
+        // Splice the cached parsed stats onto this query's seed rows.
+        let actions = seed
+            .into_iter()
+            .zip(parsed)
+            .map(move |(batch, parsed)| -> DeltaResult<ActionsBatch> {
+                let mut fields: Vec<ArrowField> = batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|field| field.as_ref().clone())
+                    .collect();
+                fields.push(ArrowField::new(
+                    "stats_parsed",
+                    parsed.data_type().clone(),
+                    true,
+                ));
+                let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
+                columns.push(parsed);
+                let batch = RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), columns)?;
+                let data = ArrowEngineData::new(batch);
+                Ok(ActionsBatch::new(transform.evaluate(&data)?, false))
+            });
+
+        let actions_with_checkpoint_info = ActionsWithCheckpointInfo {
+            actions,
+            checkpoint_info: CheckpointReadInfo {
+                has_stats_parsed: true,
+                has_partition_values_parsed: false,
+                checkpoint_read_schema: output_schema,
+            },
+        };
         Ok(Box::new(self.scan_metadata_inner(
             engine,
             actions_with_checkpoint_info,

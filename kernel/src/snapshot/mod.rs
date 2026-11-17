@@ -81,6 +81,12 @@ pub struct Snapshot {
     crc: SnapshotCrc,
     /// Best-effort "confirmed latest at build time" flag. See [`Snapshot::built_as_latest`].
     built_as_latest: bool,
+    /// Cache of parsed seed stats for the seeded replay path (see
+    /// [`crate::scan::Scan::scan_metadata_from`]). Populated lazily on the first warm query
+    /// against this snapshot; a new snapshot version gets a new `Snapshot` instance, so the
+    /// cache is invalidated naturally. Gated on Arrow because it caches Arrow columns.
+    #[cfg(any(feature = "arrow-58", feature = "arrow-59"))]
+    pub(crate) parsed_seed_stats: std::sync::Mutex<Option<crate::scan::SeedParsedStats>>,
 }
 
 impl PartialEq for Snapshot {
@@ -193,6 +199,8 @@ impl Snapshot {
             table_configuration,
             crc,
             built_as_latest,
+            #[cfg(any(feature = "arrow-58", feature = "arrow-59"))]
+            parsed_seed_stats: std::sync::Mutex::new(None),
         })
     }
 

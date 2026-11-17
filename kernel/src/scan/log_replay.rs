@@ -9,7 +9,11 @@ use super::data_skipping::DataSkippingFilter;
 use super::metrics::ScanMetrics;
 use super::state_info::StateInfo;
 use super::{PhysicalPredicate, ScanMetadata, COMMIT_READ_SCHEMA};
+#[cfg(any(feature = "arrow-58", feature = "arrow-59"))]
+use super::restored_add_schema;
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
+#[cfg(any(feature = "arrow-58", feature = "arrow-59"))]
+use crate::actions::ADD_NAME;
 use crate::engine_data::{EngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{
     col, column_expr_ref, column_name, null_lit, ColumnName, Expression, ExpressionRef, Predicate,
@@ -26,6 +30,8 @@ use crate::schema::{
     lazy_schema_ref, ColumnNamesAndTypes, DataType, MapType, SchemaRef, SchemaStructPatchBuilder,
     StructField, StructType, ToSchema as _,
 };
+#[cfg(any(feature = "arrow-58", feature = "arrow-59"))]
+use crate::schema::StructTypeBuilder;
 use crate::table_features::ColumnMappingMode;
 use crate::utils::{require, FoldWithOption as _};
 use crate::{DeltaResult, Engine, Error, ExpressionEvaluator};
@@ -781,7 +787,7 @@ pub(crate) static SCAN_ROW_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
 /// regardless of the engine's options, and keeps data-skipping paths uniform:
 /// `partitionValues_parsed.<col>` parallels `stats_parsed.minValues.<col>`. The checkpoint source
 /// is also `add.partitionValues_parsed`, a sibling of `add.stats_parsed`.
-fn scan_row_schema_with_parsed_columns(
+pub(crate) fn scan_row_schema_with_parsed_columns(
     stats_schema: Option<SchemaRef>,
     partition_schema: Option<SchemaRef>,
 ) -> DeltaResult<SchemaRef> {
@@ -912,6 +918,140 @@ pub(crate) fn get_scan_metadata_transform_expr() -> ExpressionRef {
         )]))
     });
     EXPR.clone()
+}
+
+/// Build the restored-add schema (the checkpoint-like `add` shape log replay consumes),
+/// optionally appending `add.stats_parsed` / `add.partitionValues_parsed` columns.
+///
+/// Seeded replay uses this so its reshaped batches match what a compatible checkpoint read
+/// would produce, letting `get_add_transform_expr` read pre-parsed stats instead of
+/// re-parsing JSON on every scan.
+#[cfg(any(feature = "arrow-58", feature = "arrow-59"))]
+pub(crate) fn restored_add_schema_with_parsed(
+    stats_schema: Option<&SchemaRef>,
+    partition_schema: Option<&SchemaRef>,
+) -> DeltaResult<SchemaRef> {
+    if stats_schema.is_none() && partition_schema.is_none() {
+        return Ok(restored_add_schema().clone());
+    }
+    let add_struct = match restored_add_schema().field(ADD_NAME).map(|field| field.data_type()) {
+        Some(DataType::Struct(add)) => add.as_ref().clone(),
+        _ => {
+            return Err(Error::internal_error(
+                "restored add schema must contain an add struct",
+            ))
+        }
+    };
+    let mut builder = StructTypeBuilder::from_schema(&add_struct);
+    if let Some(stats_schema) = stats_schema {
+        builder = builder.add_field(StructField::nullable(
+            STATS_PARSED_NAME,
+            stats_schema.as_ref().clone(),
+        ));
+    }
+    if let Some(partition_schema) = partition_schema {
+        builder = builder.add_field(StructField::nullable(
+            PARTITION_VALUES_PARSED_NAME,
+            partition_schema.as_ref().clone(),
+        ));
+    }
+    let add_with_parsed = builder.build()?;
+    Ok(Arc::new(StructType::try_new([StructField::nullable(
+        ADD_NAME,
+        DataType::Struct(Box::new(add_with_parsed)),
+    )])?))
+}
+
+/// Build an expression that projects `requested` (a parsed-stats or parsed-partitions schema)
+/// out of a wider struct column rooted at `input_path` within the transform's input schema.
+///
+/// `available` is the struct to resolve each level's children against: the seed column's
+/// schema at the top level, and the matched child struct at deeper levels. Leaves missing
+/// from `available` evaluate to NULL, mirroring checkpoint rows whose pre-parsed columns
+/// lack optional fields. Field names come from the evaluator's declared output type, so
+/// this expression stays safe for nested and column-mapped schemas.
+#[cfg(any(feature = "arrow-58", feature = "arrow-59"))]
+fn parsed_projection_expr(
+    input_path: &[&str],
+    available: Option<&StructType>,
+    requested: &StructType,
+) -> ExpressionRef {
+    let fields = requested
+        .fields()
+        .map(|field| {
+            let avail_field = available.and_then(|schema| schema.field(field.name()));
+            let child_path: Vec<&str> = input_path
+                .iter()
+                .copied()
+                .chain(std::iter::once(field.name().as_str()))
+                .collect();
+            match (field.data_type(), avail_field.map(|f| f.data_type())) {
+                (
+                    DataType::Struct(requested_inner),
+                    Some(DataType::Struct(available_inner)),
+                ) => parsed_projection_expr(
+                    &child_path,
+                    Some(available_inner.as_ref()),
+                    requested_inner,
+                ),
+                (DataType::Struct(requested_inner), _) => {
+                    // Requested section absent from (or malformed in) the seed: emit an
+                    // all-null struct so the projected column keeps the requested shape.
+                    parsed_projection_expr(&child_path, None, requested_inner)
+                }
+                (_, Some(_)) => Expression::column(child_path).into(),
+                (_, None) => null_lit(field.data_type().clone()).into(),
+            }
+        })
+        .collect::<Vec<_>>();
+    Arc::new(Expression::struct_from(fields))
+}
+
+/// Build the scan-metadata transform for seeded replay whose input rows may carry pre-parsed
+/// `stats_parsed` / `partitionValues_parsed` columns.
+///
+/// Input: the scan-row schema extended with the seed's parsed columns (the same shape
+/// [`scan_row_schema_with_parsed_columns`] describes). Output: the restored-add schema
+/// extended with the scan's *requested* parsed columns
+/// ([`restored_add_schema_with_parsed`]). Callers must have validated seed/requested
+/// compatibility (see `LogSegment::schema_has_compatible_stats_parsed`) and pass the
+/// requested schemas only for the columns they set flags for in `CheckpointReadInfo`.
+#[cfg(any(feature = "arrow-58", feature = "arrow-59"))]
+pub(crate) fn get_scan_metadata_transform_expr_with_parsed(
+    seed_stats: Option<&SchemaRef>,
+    seed_partitions: Option<&SchemaRef>,
+    requested_stats: Option<&SchemaRef>,
+    requested_partitions: Option<&SchemaRef>,
+) -> ExpressionRef {
+    let mut add_fields: Vec<Arc<Expression>> = vec![
+        column_expr_ref!("path"),
+        column_expr_ref!("fileConstantValues.partitionValues"),
+        column_expr_ref!("size"),
+        column_expr_ref!("modificationTime"),
+        column_expr_ref!("stats"),
+        column_expr_ref!("fileConstantValues.tags"),
+        column_expr_ref!("deletionVector"),
+        column_expr_ref!("fileConstantValues.baseRowId"),
+        column_expr_ref!("fileConstantValues.defaultRowCommitVersion"),
+        column_expr_ref!("fileConstantValues.clusteringProvider"),
+    ];
+    if let Some(requested) = requested_stats {
+        add_fields.push(parsed_projection_expr(
+            &["stats_parsed"],
+            seed_stats.as_deref().map(AsRef::as_ref),
+            requested.as_ref(),
+        ));
+    }
+    if let Some(requested) = requested_partitions {
+        add_fields.push(parsed_projection_expr(
+            &["partitionValues_parsed"],
+            seed_partitions.as_deref().map(AsRef::as_ref),
+            requested.as_ref(),
+        ));
+    }
+    Arc::new(Expression::struct_from([Arc::new(Expression::struct_from(
+        add_fields,
+    ))]))
 }
 
 impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
