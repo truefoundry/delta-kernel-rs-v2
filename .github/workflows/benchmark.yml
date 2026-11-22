@@ -93,9 +93,7 @@ jobs:
     concurrency:
       group: bench-${{ github.event.pull_request.number || github.event.issue.number }}
       cancel-in-progress: true
-    runs-on:
-      group: public-runner-group
-      labels: "gh-pb-runners-2c"
+    runs-on: ubuntu-latest
     permissions:
       contents: read
     outputs:
