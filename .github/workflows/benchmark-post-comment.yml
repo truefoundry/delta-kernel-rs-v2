@@ -69,7 +69,9 @@ jobs:
       contains(fromJSON('["success","failure","timed_out"]'), github.event.workflow_run.conclusion)
       && (github.event.workflow_run.event == 'pull_request'
           || github.event.workflow_run.event == 'issue_comment')
-    runs-on: ubuntu-latest
+    runs-on:
+      group: public-runner-group
+      labels: "gh-pb-runners-2c"
     permissions:
       pull-requests: write
       # download-artifact across workflows needs actions:read.
@@ -188,7 +190,9 @@ jobs:
       contains(fromJSON('["failure","timed_out"]'), github.event.workflow_run.conclusion)
       && (github.event.workflow_run.event == 'pull_request'
           || github.event.workflow_run.event == 'issue_comment')
-    runs-on: ubuntu-latest
+    runs-on:
+      group: public-runner-group
+      labels: "gh-pb-runners-2c"
     permissions:
       pull-requests: write
       actions: read

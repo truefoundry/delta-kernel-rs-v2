@@ -10,7 +10,9 @@ on:
 
 jobs:
   validate-title:
-    runs-on: ubuntu-latest
+    runs-on:
+      group: public-runner-group
+      labels: "gh-pb-runners-2c"
     permissions:
       contents: read
       actions: read # cross-workflow artifact download (workflow_run path)

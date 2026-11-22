@@ -9,7 +9,9 @@ on:
 
 jobs:
   validate-body:
-    runs-on: ubuntu-latest
+    runs-on:
+      group: public-runner-group
+      labels: "gh-pb-runners-2c"
     steps:
       - name: Validate PR Body
         shell: bash

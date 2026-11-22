@@ -11,7 +11,9 @@ on:
 
 jobs:
   update_label_if_needed:
-    runs-on: ubuntu-latest
+    runs-on:
+      group: public-runner-group
+      labels: "gh-pb-runners-2c"
     permissions:
       pull-requests: write
       actions: read

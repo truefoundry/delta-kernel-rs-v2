@@ -9,7 +9,9 @@ permissions:
 
 jobs:
   auto-assign:
-    runs-on: ubuntu-latest
+    runs-on:
+      group: public-runner-group
+      labels: "gh-pb-runners-2c"
     if: (!github.event.issue.pull_request) && github.event.comment.body == 'take'
     concurrency:
       # Only run one at a time for each user.
