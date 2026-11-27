@@ -789,11 +789,15 @@ fn test_scan_metadata_from_without_reuse_takes_the_json_path() {
             .with_stats(StatsOptions::struct_columns(vec![column_name!("id")]))
             .build()
             .unwrap();
+        // Unit tests run with reuse on, so `scan_metadata_from` reuses; the original replay is
+        // called directly for the off case.
+        let metadata = if reuse {
+            scan.scan_metadata_from(engine.as_ref(), version, schema, data, None)
+        } else {
+            scan.scan_metadata_from_without_reuse(engine.as_ref(), version, data)
+        };
         let mut paths = Vec::new();
-        for metadata in scan
-            .scan_metadata_from_with_reuse(engine.as_ref(), version, schema, data, reuse)
-            .unwrap()
-        {
+        for metadata in metadata.unwrap() {
             paths = metadata
                 .unwrap()
                 .visit_scan_files(paths, |paths, file| paths.push(file.path.to_string()))

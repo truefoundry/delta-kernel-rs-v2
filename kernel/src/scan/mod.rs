@@ -950,24 +950,27 @@ impl Scan {
         existing_data: impl IntoIterator<Item = Box<dyn EngineData>> + 'static,
         _existing_predicate: Option<PredicateRef>,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ScanMetadata>>>> {
-        self.scan_metadata_from_with_reuse(
-            engine,
-            existing_version,
-            existing_data_schema,
-            existing_data,
-            reuse_cached_stats_enabled(),
-        )
+        if reuse_cached_stats_enabled() {
+            if let Some(stats_schema) = self.reusable_cached_stats_schema(&existing_data_schema) {
+                return self.scan_metadata_from_with_reuse(
+                    engine,
+                    existing_version,
+                    existing_data_schema,
+                    stats_schema,
+                    existing_data,
+                );
+            }
+        }
+        self.scan_metadata_from_without_reuse(engine, existing_version, existing_data)
     }
 
-    /// [`Self::scan_metadata_from`] with the reuse switch passed in, so tests can run both modes
-    /// in one process.
-    fn scan_metadata_from_with_reuse(
+    /// [`Self::scan_metadata_from`] without reusing cached typed stats: the original replay, which
+    /// reshapes cached rows to [`restored_add_schema`] and parses their JSON stats.
+    fn scan_metadata_from_without_reuse(
         &self,
         engine: &dyn Engine,
         existing_version: Version,
-        existing_data_schema: SchemaRef,
         existing_data: impl IntoIterator<Item = Box<dyn EngineData>> + 'static,
-        reuse_cached_stats: bool,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ScanMetadata>>>> {
         // TODO(#966): validate that the current predicate is compatible with the hint predicate.
 
@@ -979,110 +982,32 @@ impl Scan {
             )));
         }
 
-        // The compatibility helper expects checkpoint-shaped data, so nest the cached scan-row
-        // schema under `add`, matching the transform output below.
-        let checkpoint_shaped_existing_schema = schema_ref! {
-            nullable ADD_NAME: (existing_data_schema.as_ref().clone()),
-        };
-        // Reuse cached typed stats only when every required leaf exists and its type can be read
-        // as the current scan's type. Otherwise log replay falls back to the JSON stats field.
-        // With reuse off (`DELTA_KERNEL_REUSE_CACHED_STATS`), this is `None` and every branch below
-        // is the original replay: cached rows reshaped to `restored_add_schema()` and their JSON
-        // parsed.
-        let stats_schema = self
-            .state_info
-            .physical_stats_schema
-            .as_ref()
-            .filter(|_| reuse_cached_stats)
-            .filter(|schema| {
-                let leaves = schema.leaves(Some(STATS_PARSED_NAME));
-                leaves
-                    .as_ref()
-                    .0
-                    .iter()
-                    .all(|column| existing_data_schema.contains_col(column.clone()))
-                    && LogSegment::schema_has_compatible_stats_parsed(
-                        checkpoint_shaped_existing_schema.as_ref(),
-                        schema,
-                    )
-            });
-        // Log replay treats cached rows like checkpoint Add actions, where typed stats are nested
-        // under `add` instead of stored at the top level.
-        let checkpoint_add_schema = Arc::new(
-            SchemaStructPatchBuilder::new()
-                .fold_with(stats_schema, |patch, schema| {
-                    patch.append_at(
-                        [ADD_NAME],
-                        StructField::nullable(STATS_PARSED_NAME, schema.as_ref().clone()),
-                    )
-                })
-                .build(restored_add_schema())?,
-        );
-
-        // In order to be processed by our log replay, re-shape the existing scan metadata back
-        // into the form read from a checkpoint. A broader cached stats struct is projected to the
-        // narrower schema required by the current scan.
-        let transform_expr = match stats_schema {
-            Some(schema) => {
-                fn project_stats_to_schema(root: ColumnName, schema: &StructType) -> Expression {
-                    let fields = schema.fields().map(|field| {
-                        let column = root.join(&ColumnName::new([field.name()]));
-                        match field.data_type() {
-                            DataType::Struct(schema) => project_stats_to_schema(column, schema),
-                            data_type => Expression::cast(column, data_type.clone()),
-                        }
-                    });
-                    Expression::struct_with_nullability_from(
-                        fields,
-                        Expression::from_pred(Expression::from(root.clone()).is_not_null()),
-                    )
-                }
-
-                let fields = [
-                    column_expr_ref!("path"),
-                    column_expr_ref!("fileConstantValues.partitionValues"),
-                    column_expr_ref!("size"),
-                    column_expr_ref!("modificationTime"),
-                    column_expr_ref!("stats"),
-                    column_expr_ref!("fileConstantValues.tags"),
-                    column_expr_ref!("deletionVector"),
-                    column_expr_ref!("fileConstantValues.baseRowId"),
-                    column_expr_ref!("fileConstantValues.defaultRowCommitVersion"),
-                    column_expr_ref!("fileConstantValues.clusteringProvider"),
-                    Arc::new(project_stats_to_schema(
-                        column_name!(STATS_PARSED_NAME),
-                        schema,
-                    )),
-                ];
-                Arc::new(Expression::struct_from([Arc::new(
-                    Expression::struct_from(fields),
-                )]))
-            }
-            None => get_scan_metadata_transform_expr(),
-        };
+        // in order to be processed by our log replay, we must re-shape the existing scan metadata
+        // back into shape as we read it from the log. Since it is already reconciled data,
+        // we treat it as if it originated from a checkpoint.
         let transform = engine.evaluation_handler().new_expression_evaluator(
-            existing_data_schema,
-            transform_expr,
-            checkpoint_add_schema.clone().into(),
+            scan_row_schema(),
+            get_scan_metadata_transform_expr(),
+            restored_add_schema().clone().into(),
         )?;
         let apply_transform = move |data: Box<dyn EngineData>| {
             Ok(ActionsBatch::new(transform.evaluate(data.as_ref())?, false))
         };
-        let existing_data = existing_data.into_iter();
 
         let log_segment = self.snapshot.log_segment();
 
         // If the snapshot version corresponds to the hint version, we process the existing data
         // to apply file skipping and provide the required transformations.
-        // Since the existing data is already reconciled, treat it as checkpoint data.
+        // Since we're only processing existing data (no checkpoint), we use the base schema
+        // and no stats_parsed optimization.
         if existing_version == self.snapshot.version() {
             let actions_with_checkpoint_info = ActionsWithCheckpointInfo {
-                actions: existing_data.map(apply_transform),
+                actions: existing_data.into_iter().map(apply_transform),
                 checkpoint_info: CheckpointReadInfo {
-                    has_stats_parsed: stats_schema.is_some(),
+                    has_stats_parsed: false,
                     has_partition_values_parsed: false,
-                    checkpoint_read_schema: checkpoint_add_schema,
-                    retains_json_stats: stats_schema.is_some(),
+                    checkpoint_read_schema: restored_add_schema().clone(),
+                    retains_json_stats: false,
                 },
             };
             return Ok(Box::new(
@@ -1114,8 +1039,8 @@ impl Scan {
             None, // No checkpoint in this incremental segment
         )?;
 
-        // The incremental segment has no checkpoint. Its checkpoint schema is unused because all
-        // of its batches are commits; the existing data below supplies the checkpoint-shaped rows.
+        // For incremental reads, new_log_segment has no checkpoint but we use the
+        // checkpoint schema returned by the function for consistency.
         let (checkpoint_schema, meta_predicate, physical_stats_schema) =
             self.checkpoint_read_options();
         let result = new_log_segment.read_actions_with_projected_checkpoint_actions(
@@ -1130,18 +1055,171 @@ impl Scan {
             // read already in flight is not interrupted mid-I/O.
             None,
         )?;
-        // Without reuse, keep the original checkpoint info of the commit-only segment.
-        let checkpoint_info = match stats_schema {
-            Some(_) => CheckpointReadInfo {
-                has_stats_parsed: true,
-                has_partition_values_parsed: false,
-                checkpoint_read_schema: checkpoint_add_schema,
-                retains_json_stats: true,
-            },
-            None => result.checkpoint_info,
-        };
         let actions_with_checkpoint_info = ActionsWithCheckpointInfo {
-            actions: result.actions.chain(existing_data.map(apply_transform)),
+            actions: result
+                .actions
+                .chain(existing_data.into_iter().map(apply_transform)),
+            checkpoint_info: result.checkpoint_info,
+        };
+
+        Ok(Box::new(self.scan_metadata_inner(
+            engine,
+            actions_with_checkpoint_info,
+        )?))
+    }
+
+    /// The scan's stats schema, when the cached rows (`existing_data_schema`) carry a
+    /// `stats_parsed` column with every leaf the scan needs, in types it can read. `None` means the
+    /// cached typed stats can't be reused and the cached rows' JSON stats must be parsed.
+    fn reusable_cached_stats_schema(&self, existing_data_schema: &SchemaRef) -> Option<SchemaRef> {
+        let stats_schema = self.state_info.physical_stats_schema.as_ref()?;
+        let leaves = stats_schema.leaves(Some(STATS_PARSED_NAME));
+        let has_all_leaves = leaves
+            .as_ref()
+            .0
+            .iter()
+            .all(|column| existing_data_schema.contains_col(column.clone()));
+        // The compatibility helper expects checkpoint-shaped data, so nest the cached scan-row
+        // schema under `add`, as log replay will see it.
+        let checkpoint_shaped_existing_schema = schema_ref! {
+            nullable ADD_NAME: (existing_data_schema.as_ref().clone()),
+        };
+        (has_all_leaves
+            && LogSegment::schema_has_compatible_stats_parsed(
+                checkpoint_shaped_existing_schema.as_ref(),
+                stats_schema,
+            ))
+        .then(|| stats_schema.clone())
+    }
+
+    /// [`Self::scan_metadata_from`] reusing the cached rows' typed stats: they are read as a
+    /// checkpoint's `add.stats_parsed` instead of parsing each row's JSON stats again.
+    /// `stats_schema` is the scan's stats schema, which the caller checked the cached
+    /// `stats_parsed` can be read as (see [`Self::reusable_cached_stats_schema`]).
+    fn scan_metadata_from_with_reuse(
+        &self,
+        engine: &dyn Engine,
+        existing_version: Version,
+        existing_data_schema: SchemaRef,
+        stats_schema: SchemaRef,
+        existing_data: impl IntoIterator<Item = Box<dyn EngineData>> + 'static,
+    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ScanMetadata>>>> {
+        let log_segment = self.snapshot.log_segment();
+        // An invalid version and a checkpoint newer than the cached rows leave nothing to reuse:
+        // the original replay reports the error or runs a full scan.
+        if existing_version > self.snapshot.version()
+            || matches!(log_segment.checkpoint_version, Some(v) if v > existing_version)
+        {
+            return self.scan_metadata_from_without_reuse(engine, existing_version, existing_data);
+        }
+
+        // Log replay treats cached rows like checkpoint Add actions, where typed stats are nested
+        // under `add` instead of stored at the top level.
+        let checkpoint_add_schema = Arc::new(
+            SchemaStructPatchBuilder::new()
+                .append_at(
+                    [ADD_NAME],
+                    StructField::nullable(STATS_PARSED_NAME, stats_schema.as_ref().clone()),
+                )
+                .build(restored_add_schema())?,
+        );
+
+        // Re-shape the cached scan rows into that checkpoint form. A broader cached stats struct
+        // is projected (and cast) to the narrower schema required by the current scan.
+        fn project_stats_to_schema(root: ColumnName, schema: &StructType) -> Expression {
+            let fields = schema.fields().map(|field| {
+                let column = root.join(&ColumnName::new([field.name()]));
+                match field.data_type() {
+                    DataType::Struct(schema) => project_stats_to_schema(column, schema),
+                    data_type => Expression::cast(column, data_type.clone()),
+                }
+            });
+            Expression::struct_with_nullability_from(
+                fields,
+                Expression::from_pred(Expression::from(root.clone()).is_not_null()),
+            )
+        }
+        let fields = [
+            column_expr_ref!("path"),
+            column_expr_ref!("fileConstantValues.partitionValues"),
+            column_expr_ref!("size"),
+            column_expr_ref!("modificationTime"),
+            column_expr_ref!("stats"),
+            column_expr_ref!("fileConstantValues.tags"),
+            column_expr_ref!("deletionVector"),
+            column_expr_ref!("fileConstantValues.baseRowId"),
+            column_expr_ref!("fileConstantValues.defaultRowCommitVersion"),
+            column_expr_ref!("fileConstantValues.clusteringProvider"),
+            Arc::new(project_stats_to_schema(
+                column_name!(STATS_PARSED_NAME),
+                &stats_schema,
+            )),
+        ];
+        let transform_expr = Arc::new(Expression::struct_from([Arc::new(
+            Expression::struct_from(fields),
+        )]));
+        let transform = engine.evaluation_handler().new_expression_evaluator(
+            existing_data_schema,
+            transform_expr,
+            checkpoint_add_schema.clone().into(),
+        )?;
+        let apply_transform = move |data: Box<dyn EngineData>| {
+            Ok(ActionsBatch::new(transform.evaluate(data.as_ref())?, false))
+        };
+        let existing_data = existing_data.into_iter().map(apply_transform);
+
+        // Cached rows read like a checkpoint with typed stats that also keeps its JSON stats, so
+        // the output can seed a later scan whose predicate needs other columns.
+        let checkpoint_info = CheckpointReadInfo {
+            has_stats_parsed: true,
+            has_partition_values_parsed: false,
+            checkpoint_read_schema: checkpoint_add_schema,
+            retains_json_stats: true,
+        };
+
+        // Same version: the cached rows are the whole file list.
+        if existing_version == self.snapshot.version() {
+            let actions_with_checkpoint_info = ActionsWithCheckpointInfo {
+                actions: existing_data,
+                checkpoint_info,
+            };
+            return Ok(Box::new(
+                self.scan_metadata_inner(engine, actions_with_checkpoint_info)?,
+            ));
+        }
+
+        // Older version: replay the commits after it first (their JSON stats are parsed by the
+        // commit transform), then the cached rows.
+        let mut ascending_commit_files = log_segment.listed.ascending_commit_files.clone();
+        ascending_commit_files.retain(|f| f.version > existing_version);
+        let log_segment_files = LogSegmentFiles {
+            ascending_commit_files,
+            latest_commit_file: log_segment.listed.latest_commit_file.clone(),
+            ..Default::default()
+        };
+        let new_log_segment = LogSegment::try_new(
+            log_segment_files,
+            log_segment.log_root.clone(),
+            Some(log_segment.end_version),
+            None, // No checkpoint in this incremental segment
+        )?;
+        // The incremental segment has no checkpoint, so its checkpoint info is unused: the cached
+        // rows are the checkpoint-shaped batches, described by `checkpoint_info` above.
+        let (checkpoint_schema, meta_predicate, physical_stats_schema) =
+            self.checkpoint_read_options();
+        let result = new_log_segment.read_actions_with_projected_checkpoint_actions(
+            engine,
+            COMMIT_READ_SCHEMA.clone(),
+            checkpoint_schema,
+            meta_predicate,
+            physical_stats_schema,
+            None,
+            // As in the original replay, cancellation relies on the batch-boundary poll in
+            // `scan_metadata_inner`.
+            None,
+        )?;
+        let actions_with_checkpoint_info = ActionsWithCheckpointInfo {
+            actions: result.actions.chain(existing_data),
             checkpoint_info,
         };
 
