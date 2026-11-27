@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, LazyLock, OnceLock};
+use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
 use delta_kernel_derive::internal_api;
@@ -11,32 +11,6 @@ use tracing::{debug, info};
 use url::Url;
 
 use self::data_skipping::as_checkpoint_skipping_predicate;
-
-/// Turns on reuse of a caller's cached typed stats in [`Scan::scan_metadata_from`].
-const REUSE_CACHED_STATS_ENV_VAR: &str = "DELTA_KERNEL_REUSE_CACHED_STATS";
-
-/// Whether [`Scan::scan_metadata_from`] may read the cached `stats_parsed` a caller passes instead
-/// of parsing each row's JSON stats again. Set `DELTA_KERNEL_REUSE_CACHED_STATS` to `true` or `1`
-/// to turn it on; unset or any other value keeps the original replay. Read once per process, and
-/// the effective value is logged. Connectors gate their own reuse work on the same value. The
-/// kernel's own unit tests default to on.
-#[internal_api]
-pub(crate) fn reuse_cached_stats_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        let value = std::env::var(REUSE_CACHED_STATS_ENV_VAR).ok();
-        let enabled = match value.as_deref().map(str::trim) {
-            Some(v) => v == "1" || v.eq_ignore_ascii_case("true"),
-            None => cfg!(test),
-        };
-        info!(
-            enabled,
-            value = value.as_deref().unwrap_or("<unset>"),
-            "{REUSE_CACHED_STATS_ENV_VAR}: cached typed stats reuse"
-        );
-        enabled
-    })
-}
 use self::log_replay::{get_scan_metadata_transform_expr, scan_action_iter, STATS_PARSED_NAME};
 use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
@@ -932,12 +906,13 @@ impl Scan {
     /// # Parameters
     ///
     /// * `existing_version` - Table version the provided data was read from.
-    /// * `existing_data_schema` - Schema shared by all provided scan metadata batches. When it
-    ///   has a `stats_parsed` column the scan can use, cached rows are not parsed again, so every
-    ///   non-null cached `stats_parsed` value must equal what parsing that row's `stats` gives,
-    ///   and a null one is read as "no stats". Pass `stats_parsed` only for rows where a parse
-    ///   succeeded with the current stats schema; the JSON parse can null a whole batch, and such
-    ///   rows must be passed without the column.
+    /// * `existing_data_schema` - Schema of every provided scan metadata batch. Passing a
+    ///   top-level `stats_parsed` column opts in to reusing it: when it has every stats column
+    ///   the scan needs, in types the scan can read, cached rows are not parsed again. Every
+    ///   non-null cached `stats_parsed` value must then equal what parsing that row's `stats`
+    ///   gives, and a null one is read as "no stats". Pass the column only when this holds for
+    ///   every batch (the JSON parse can null a whole batch); otherwise pass the plain scan row
+    ///   schema, and the cached rows' JSON stats are parsed as before.
     /// * `existing_data` - Existing processed scan metadata with all selection vectors applied.
     /// * `existing_predicate` - The predicate used by the previous scan.
     #[allow(unused)]
@@ -950,16 +925,14 @@ impl Scan {
         existing_data: impl IntoIterator<Item = Box<dyn EngineData>> + 'static,
         _existing_predicate: Option<PredicateRef>,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ScanMetadata>>>> {
-        if reuse_cached_stats_enabled() {
-            if let Some(stats_schema) = self.reusable_cached_stats_schema(&existing_data_schema) {
-                return self.scan_metadata_from_with_reuse(
-                    engine,
-                    existing_version,
-                    existing_data_schema,
-                    stats_schema,
-                    existing_data,
-                );
-            }
+        if let Some(stats_schema) = self.reusable_cached_stats_schema(&existing_data_schema) {
+            return self.scan_metadata_from_with_reuse(
+                engine,
+                existing_version,
+                existing_data_schema,
+                stats_schema,
+                existing_data,
+            );
         }
         self.scan_metadata_from_without_reuse(engine, existing_version, existing_data)
     }
@@ -1007,7 +980,6 @@ impl Scan {
                     has_stats_parsed: false,
                     has_partition_values_parsed: false,
                     checkpoint_read_schema: restored_add_schema().clone(),
-                    retains_json_stats: false,
                 },
             };
             return Ok(Box::new(
@@ -1072,7 +1044,14 @@ impl Scan {
     /// `stats_parsed` column with every leaf the scan needs, in types it can read. `None` means the
     /// cached typed stats can't be reused and the cached rows' JSON stats must be parsed.
     fn reusable_cached_stats_schema(&self, existing_data_schema: &SchemaRef) -> Option<SchemaRef> {
+        // A scan that skips stats reads none, so there is nothing to reuse.
+        if self.skip_stats() {
+            return None;
+        }
         let stats_schema = self.state_info.physical_stats_schema.as_ref()?;
+        // Unlike a checkpoint read, which fills missing columns with nulls, the reuse transform
+        // names each leaf, so a missing one would fail evaluation. The cached JSON may still have
+        // it, so fall back to parsing instead.
         let leaves = stats_schema.leaves(Some(STATS_PARSED_NAME));
         let has_all_leaves = leaves
             .as_ref()
@@ -1168,13 +1147,13 @@ impl Scan {
         };
         let existing_data = existing_data.into_iter().map(apply_transform);
 
-        // Cached rows read like a checkpoint with typed stats that also keeps its JSON stats, so
-        // the output can seed a later scan whose predicate needs other columns.
+        // Cached rows read like a checkpoint with typed stats. Their schema keeps `add.stats`, so
+        // replay passes the JSON through as the original replay does, and the output can seed a
+        // later scan whose predicate needs other columns.
         let checkpoint_info = CheckpointReadInfo {
             has_stats_parsed: true,
             has_partition_values_parsed: false,
             checkpoint_read_schema: checkpoint_add_schema,
-            retains_json_stats: true,
         };
 
         // Same version: the cached rows are the whole file list.
@@ -1474,7 +1453,6 @@ impl Scan {
             has_stats_parsed: false,
             has_partition_values_parsed: false,
             checkpoint_read_schema,
-            retains_json_stats: false,
         };
         let processor = ScanLogReplayProcessor::new(
             engine.as_ref(),

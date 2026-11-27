@@ -69,12 +69,6 @@ pub(crate) struct CheckpointReadInfo {
     /// The schema used to read checkpoint files, potentially including stats_parsed.
     #[allow(unused)]
     pub checkpoint_read_schema: SchemaRef,
-    /// Whether the checkpoint-shaped batches are a caller's cached scan metadata (see
-    /// `Scan::scan_metadata_from`) whose typed stats are reused. Only those keep their JSON
-    /// `stats` next to `stats_parsed`; a real checkpoint read with typed stats emits null JSON.
-    #[serde(default)]
-    #[allow(unused)]
-    pub retains_json_stats: bool,
 }
 
 impl CheckpointReadInfo {
@@ -86,7 +80,6 @@ impl CheckpointReadInfo {
             has_stats_parsed: false,
             has_partition_values_parsed: false,
             checkpoint_read_schema: LOG_ADD_SCHEMA.clone(),
-            retains_json_stats: false,
         }
     }
 }
@@ -890,7 +883,9 @@ impl LogSegment {
     /// The schema of the checkpoint file actions that log replay reads: the checkpoint's own
     /// schema, or the first sidecar's when the checkpoint references sidecars. `None` without a
     /// checkpoint. Replay takes typed stats from `add.stats_parsed` only when this schema has it,
-    /// so a connector can tell from it whether replayed stats came from JSON.
+    /// so a connector can tell from it whether replayed stats came from JSON. May read a parquet
+    /// footer (or a sidecar's, for a V2 checkpoint) when `_last_checkpoint` has no schema hint.
+    #[allow(unused)]
     #[internal_api]
     pub(crate) fn checkpoint_file_actions_schema(
         &self,
@@ -1184,7 +1179,6 @@ impl LogSegment {
             has_stats_parsed,
             has_partition_values_parsed,
             checkpoint_read_schema: augmented_checkpoint_read_schema,
-            retains_json_stats: false,
         };
         Ok(ActionsWithCheckpointInfo {
             actions: actions_iter,
