@@ -9,13 +9,16 @@ use url::Url;
 
 use super::*;
 use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, STATS_PARSED};
-use crate::arrow::array::{Array, BooleanArray, Int64Array, StringArray, StructArray};
+use crate::arrow::array::{
+    new_null_array, Array, BooleanArray, Int64Array, StringArray, StructArray,
+};
 use crate::arrow::compute::filter_record_batch;
 use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Fields, Schema as ArrowSchema};
 use crate::arrow::record_batch::RecordBatch;
 use crate::arrow::util::display::array_value_to_string;
 use crate::committer::FileSystemCommitter;
-use crate::engine::arrow_data::ArrowEngineData;
+use crate::engine::arrow_conversion::TryFromArrow as _;
+use crate::engine::arrow_data::{extract_record_batch, ArrowEngineData};
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::engine::sync::SyncEngine;
 use crate::engine::test_delegating::DelegatingEngine;
@@ -32,6 +35,7 @@ use crate::schema::{
     StructType,
 };
 use crate::transaction::create_table::create_table;
+use crate::unit_test_utils::string_array_to_engine_data;
 use crate::{
     DeltaResultIteratorStatic, Engine, EngineData, FileDataReadResultIterator, FileMeta,
     ParquetFooter, ParquetHandler, PredicateRef, Snapshot,
@@ -657,12 +661,524 @@ fn test_scan_metadata_from_same_version() {
         .try_collect()
         .unwrap();
     let new_files: Vec<_> = scan
-        .scan_metadata_from(engine.as_ref(), version, files, None)
+        .scan_metadata_from(engine.as_ref(), version, scan_row_schema(), files, None)
         .unwrap()
         .try_collect()
         .unwrap();
 
     assert_eq!(new_files.len(), 1);
+}
+
+/// Reuse reads the cached typed stats, projected to the scan's narrower stats schema, and prunes
+/// the same files as a fresh scan. The cache comes from a struct-stats-only checkpoint, so it
+/// deliberately breaks the reuse contract (typed stats with null JSON): only reuse can prune, which
+/// shows which path ran. Opting out with the plain scan row schema parses the null JSON and keeps
+/// every file, though the batches still carry `stats_parsed`.
+#[test_log::test]
+fn test_scan_metadata_from_reuses_cached_typed_stats_only_when_opted_in() {
+    let path = fs::canonicalize(PathBuf::from(
+        "./tests/data/v1-single-part-struct-stats-only/",
+    ))
+    .unwrap();
+    let url = Url::from_directory_path(path).unwrap();
+    let engine = Arc::new(SyncEngine::new());
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+    let version = snapshot.version();
+
+    // A predicate-free cache with every typed stats column and no JSON stats.
+    let cache = || -> (SchemaRef, Vec<Box<dyn EngineData>>) {
+        let scan = Arc::clone(&snapshot)
+            .scan_builder()
+            .with_stats(StatsOptions::all_struct())
+            .build()
+            .unwrap();
+        let data: Vec<Box<dyn EngineData>> = scan
+            .scan_metadata(engine.as_ref())
+            .unwrap()
+            .map_ok(|ScanMetadata { scan_files, .. }| scan_files.apply_selection_vector().unwrap())
+            .try_collect()
+            .unwrap();
+        for data in &data {
+            let batch = extract_record_batch(data.as_ref()).unwrap();
+            assert_eq!(
+                batch.column_by_name("stats").unwrap().null_count(),
+                batch.num_rows()
+            );
+            assert_eq!(batch.column_by_name(STATS_PARSED).unwrap().null_count(), 0);
+        }
+        assert_eq!(data.iter().map(|data| data.len()).sum::<usize>(), 5);
+        let batch = extract_record_batch(data[0].as_ref()).unwrap();
+        let schema = Arc::new(StructType::try_from_arrow(batch.schema().as_ref()).unwrap());
+        (schema, data)
+    };
+    // The scan asks for typed stats of `id` only, narrower than the cache.
+    let scan = || {
+        Arc::clone(&snapshot)
+            .scan_builder()
+            .with_predicate(Arc::new(Pred::gt(col!("id"), lit(3i64))))
+            .with_stats(StatsOptions::struct_columns(vec![column_name!("id")]))
+            .build()
+            .unwrap()
+    };
+    let replay = |opt_in: bool| -> Vec<String> {
+        let (schema, data) = cache();
+        let schema = if opt_in { schema } else { scan_row_schema() };
+        let mut paths = Vec::new();
+        for metadata in scan()
+            .scan_metadata_from(engine.as_ref(), version, schema, data, None)
+            .unwrap()
+        {
+            paths = metadata
+                .unwrap()
+                .visit_scan_files(paths, |paths, file| paths.push(file.path.to_string()))
+                .unwrap();
+        }
+        paths.sort_unstable();
+        paths
+    };
+
+    let mut fresh_paths = get_files_for_scan(scan(), engine.as_ref()).unwrap();
+    fresh_paths.sort_unstable();
+    assert_eq!(fresh_paths.len(), 2);
+    assert_eq!(replay(true), fresh_paths, "reuse prunes like a fresh scan");
+    assert_eq!(
+        replay(false).len(),
+        5,
+        "without opting in, the null JSON stats prune nothing"
+    );
+}
+
+#[test_log::test]
+fn test_scan_metadata_from_preserves_json_stats_for_later_replay() {
+    // Version 4 precedes the checkpoint: its four files have JSON stats from commits.
+    let path = fs::canonicalize(PathBuf::from(
+        "./tests/data/v1-single-part-struct-stats-only/",
+    ))
+    .unwrap();
+    let url = Url::from_directory_path(path).unwrap();
+    let engine = SyncEngine::new();
+    let snapshot = Snapshot::builder_for(url)
+        .at_version(4)
+        .build(&engine)
+        .unwrap();
+    let version = snapshot.version();
+
+    // Cache all files with both JSON and typed stats. No predicate has removed any files.
+    let cache_scan = snapshot
+        .clone()
+        .scan_builder()
+        .with_stats(StatsOptions::all_struct())
+        .build()
+        .unwrap();
+    let mut cached_metadata = Vec::new();
+    for metadata in cache_scan.scan_metadata(&engine).unwrap() {
+        let metadata = metadata.unwrap();
+        let data = metadata.scan_files.apply_selection_vector().unwrap();
+        let batch = extract_record_batch(data.as_ref()).unwrap();
+        let json_stats = get_column!(batch, "stats", StringArray);
+        assert_eq!(
+            json_stats.null_count(),
+            0,
+            "cache must start with JSON stats"
+        );
+        cached_metadata.push(data);
+    }
+    let cached_batch = extract_record_batch(cached_metadata[0].as_ref()).unwrap();
+    let cached_schema =
+        Arc::new(StructType::try_from_arrow(cached_batch.schema().as_ref()).unwrap());
+    assert_eq!(
+        cached_metadata.iter().map(|data| data.len()).sum::<usize>(),
+        4
+    );
+
+    // First replay: request only `id` typed stats, but keep JSON for queries on other columns.
+    let id_stats_scan = snapshot
+        .clone()
+        .scan_builder()
+        .with_stats(StatsOptions::struct_columns(vec![column_name!("id")]))
+        .build()
+        .unwrap();
+    assert!(
+        id_stats_scan
+            .reusable_cached_stats_schema(&cached_schema)
+            .is_some(),
+        "the first replay must take the reuse path"
+    );
+    let replayed_metadata: Vec<_> = id_stats_scan
+        .scan_metadata_from(&engine, version, cached_schema, cached_metadata, None)
+        .unwrap()
+        .map_ok(|metadata| metadata.scan_files.apply_selection_vector().unwrap())
+        .try_collect()
+        .unwrap();
+    let replayed_batch = extract_record_batch(replayed_metadata[0].as_ref()).unwrap();
+    let replayed_schema =
+        Arc::new(StructType::try_from_arrow(replayed_batch.schema().as_ref()).unwrap());
+    assert_eq!(
+        replayed_metadata
+            .iter()
+            .map(|data| data.len())
+            .sum::<usize>(),
+        4
+    );
+    assert!(replayed_schema.contains_col([STATS_PARSED, MIN_VALUES, "id"]));
+    assert!(!replayed_schema.contains_col([STATS_PARSED, MIN_VALUES, "value"]));
+    for data in &replayed_metadata {
+        let batch = extract_record_batch(data.as_ref()).unwrap();
+        let json_stats = get_column!(batch, "stats", StringArray);
+        assert_eq!(
+            json_stats.null_count(),
+            0,
+            "replay must retain existing JSON stats"
+        );
+    }
+
+    // Second replay: `value` is absent from the typed stats, so pruning needs the retained JSON.
+    let value_scan = snapshot
+        .scan_builder()
+        .with_predicate(Arc::new(Pred::eq(col!("value"), lit("value_4"))))
+        .with_stats(StatsOptions::struct_columns(vec![column_name!("value")]))
+        .build()
+        .unwrap();
+    assert!(
+        value_scan
+            .reusable_cached_stats_schema(&replayed_schema)
+            .is_none(),
+        "typed stats without `value` must fall back to the retained JSON"
+    );
+    let mut replayed_paths = Vec::new();
+    for metadata in value_scan
+        .scan_metadata_from(&engine, version, replayed_schema, replayed_metadata, None)
+        .unwrap()
+    {
+        replayed_paths = metadata
+            .unwrap()
+            .visit_scan_files(replayed_paths, |paths, file| {
+                paths.push(file.path.to_string())
+            })
+            .unwrap();
+    }
+
+    // A fresh scan of the same version and predicate identifies the one expected file.
+    let mut expected_paths = get_files_for_scan(value_scan, &engine).unwrap();
+    assert_eq!(expected_paths.len(), 1);
+    expected_paths.sort_unstable();
+    replayed_paths.sort_unstable();
+    assert_eq!(
+        replayed_paths, expected_paths,
+        "replaying the cache must prune the same files as a fresh scan"
+    );
+}
+
+#[test_log::test]
+fn test_scan_metadata_from_updates_typed_cache_with_new_commits() {
+    let path = fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
+    let url = Url::from_directory_path(path).unwrap();
+    let engine = Arc::new(SyncEngine::new());
+
+    // Version 3 has a checkpoint with four files. Cache its complete typed stats.
+    let version_three_snapshot = Snapshot::builder_for(url.clone())
+        .at_version(3)
+        .build(engine.as_ref())
+        .unwrap();
+    let version_three_scan = version_three_snapshot
+        .scan_builder()
+        .with_stats(StatsOptions::all_struct())
+        .build()
+        .unwrap();
+    let cached_metadata: Vec<Box<dyn EngineData>> = version_three_scan
+        .scan_metadata(engine.as_ref())
+        .unwrap()
+        .map_ok(|ScanMetadata { scan_files, .. }| {
+            let data = scan_files.apply_selection_vector().unwrap();
+            let batch: RecordBatch = ArrowEngineData::try_from_engine_data(data).unwrap().into();
+
+            // The cache has typed stats but no JSON stats, so replay cannot fall back to JSON.
+            let json_stats = batch.column_by_name("stats").unwrap();
+            let typed_stats = batch.column_by_name(STATS_PARSED).unwrap();
+            assert_eq!(json_stats.null_count(), batch.num_rows());
+            assert_eq!(typed_stats.null_count(), 0);
+            Box::new(ArrowEngineData::from(batch)) as Box<dyn EngineData>
+        })
+        .try_collect()
+        .unwrap();
+    let cached_batch = extract_record_batch(cached_metadata[0].as_ref()).unwrap();
+    let cached_metadata_schema =
+        Arc::new(StructType::try_from_arrow(cached_batch.schema().as_ref()).unwrap());
+    assert_eq!(
+        cached_metadata.iter().map(|data| data.len()).sum::<usize>(),
+        4
+    );
+
+    // Version 5 adds two commits. A fresh scan establishes the expected files for `id > 250`.
+    let version_five_snapshot = Snapshot::builder_for(url)
+        .at_version(5)
+        .build(engine.as_ref())
+        .unwrap();
+    let predicate: PredicateRef = Arc::new(Pred::gt(col!("id"), lit(250i64)));
+    let stats_options = StatsOptions::struct_columns(vec![column_name!("id")]);
+    let fresh_scan = Arc::clone(&version_five_snapshot)
+        .scan_builder()
+        .with_predicate(predicate.clone())
+        .with_stats(stats_options.clone())
+        .build()
+        .unwrap();
+    let mut fresh_paths = get_files_for_scan(fresh_scan, engine.as_ref()).unwrap();
+    assert_eq!(fresh_paths.len(), 4);
+
+    // Replay from version 3. This must combine the typed cache with both newer commits.
+    let replay_scan = version_five_snapshot
+        .scan_builder()
+        .with_predicate(predicate)
+        .with_stats(stats_options)
+        .build()
+        .unwrap();
+    let mut replayed_paths = Vec::new();
+    for metadata in replay_scan
+        .scan_metadata_from(
+            engine.as_ref(),
+            3,
+            cached_metadata_schema,
+            cached_metadata,
+            None,
+        )
+        .unwrap()
+    {
+        replayed_paths = metadata
+            .unwrap()
+            .visit_scan_files(replayed_paths, |paths, file| {
+                paths.push(file.path.to_string());
+            })
+            .unwrap();
+    }
+
+    // Compare exact files rather than only the number selected.
+    fresh_paths.sort_unstable();
+    replayed_paths.sort_unstable();
+    assert_eq!(replayed_paths, fresh_paths);
+}
+
+/// Newer commits replay ahead of the reused cached rows, so a commit that removes a cached file
+/// wins. Version 1 replaces the version 0 file with the same file plus a deletion vector.
+#[test_log::test]
+fn test_scan_metadata_from_reuse_applies_newer_removes() {
+    let path = fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
+    let url = Url::from_directory_path(path).unwrap();
+    let engine = Arc::new(SyncEngine::new());
+    let version_zero_snapshot = Snapshot::builder_for(url.clone())
+        .at_version(0)
+        .build(engine.as_ref())
+        .unwrap();
+    let cached_metadata: Vec<Box<dyn EngineData>> = version_zero_snapshot
+        .scan_builder()
+        .with_stats(StatsOptions::all_struct())
+        .build()
+        .unwrap()
+        .scan_metadata(engine.as_ref())
+        .unwrap()
+        .map_ok(|ScanMetadata { scan_files, .. }| scan_files.apply_selection_vector().unwrap())
+        .try_collect()
+        .unwrap();
+    let cached_batch = extract_record_batch(cached_metadata[0].as_ref()).unwrap();
+    let cached_metadata_schema =
+        Arc::new(StructType::try_from_arrow(cached_batch.schema().as_ref()).unwrap());
+
+    let scan = Snapshot::builder_for(url)
+        .at_version(1)
+        .build(engine.as_ref())
+        .unwrap()
+        .scan_builder()
+        .with_stats(StatsOptions::all_struct())
+        .build()
+        .unwrap();
+    assert!(
+        scan.reusable_cached_stats_schema(&cached_metadata_schema)
+            .is_some(),
+        "the replay below must take the reuse path"
+    );
+    let mut files = Vec::new();
+    for metadata in scan
+        .scan_metadata_from(
+            engine.as_ref(),
+            0,
+            cached_metadata_schema,
+            cached_metadata,
+            None,
+        )
+        .unwrap()
+    {
+        files = metadata
+            .unwrap()
+            .visit_scan_files(files, |files, file| {
+                files.push(file.dv_info.has_vector());
+            })
+            .unwrap();
+    }
+    assert_eq!(
+        files,
+        [true],
+        "only the version 1 add, with its deletion vector, survives"
+    );
+}
+
+#[test_log::test]
+fn test_scan_metadata_from_handles_cached_typed_stats_across_type_widening() {
+    let path = fs::canonicalize(PathBuf::from("./tests/data/type-widening/")).unwrap();
+    let url = Url::from_directory_path(path).unwrap();
+    let engine = Arc::new(SyncEngine::new());
+
+    // Version 1 has one file where `int_long` is the Int32 value 2. Cache its typed stats, with
+    // the JSON stats nulled so the fallback could not prune the file.
+    let version_one_snapshot = Snapshot::builder_for(url.clone())
+        .at_version(1)
+        .build(engine.as_ref())
+        .unwrap();
+    let version_one_scan = version_one_snapshot
+        .scan_builder()
+        .with_stats(StatsOptions::all())
+        .build()
+        .unwrap();
+    let cached_metadata: Vec<Box<dyn EngineData>> = version_one_scan
+        .scan_metadata(engine.as_ref())
+        .unwrap()
+        .map_ok(|ScanMetadata { scan_files, .. }| {
+            let data = scan_files.apply_selection_vector().unwrap();
+            let batch: RecordBatch = ArrowEngineData::try_from_engine_data(data).unwrap().into();
+            let stats = batch.schema().index_of("stats").unwrap();
+            let mut columns = batch.columns().to_vec();
+            columns[stats] = new_null_array(columns[stats].data_type(), batch.num_rows());
+            let batch = RecordBatch::try_new(batch.schema(), columns).unwrap();
+            Box::new(ArrowEngineData::from(batch)) as Box<dyn EngineData>
+        })
+        .try_collect()
+        .unwrap();
+    let cached_batch = extract_record_batch(cached_metadata[0].as_ref()).unwrap();
+    let cached_metadata_schema =
+        Arc::new(StructType::try_from_arrow(cached_batch.schema().as_ref()).unwrap());
+
+    // Version 2 widens `int_long` to Int64 and adds a file whose value exceeds 1,000. A fresh
+    // scan therefore prunes the version 1 file and keeps only the new file.
+    let version_two_snapshot = Snapshot::builder_for(url)
+        .at_version(2)
+        .build(engine.as_ref())
+        .unwrap();
+    let predicate: PredicateRef = Arc::new(Pred::gt(col!("int_long"), lit(1_000i64)));
+    let stats_options = StatsOptions::struct_columns(vec![column_name!("int_long")]);
+    let fresh_scan = Arc::clone(&version_two_snapshot)
+        .scan_builder()
+        .with_predicate(predicate.clone())
+        .with_stats(stats_options.clone())
+        .build()
+        .unwrap();
+    let mut fresh_paths = get_files_for_scan(fresh_scan, engine.as_ref()).unwrap();
+    assert_eq!(fresh_paths.len(), 1);
+
+    // Incremental replay must read the cached Int32 stats as Int64.
+    let replay_scan = version_two_snapshot
+        .scan_builder()
+        .with_predicate(predicate)
+        .with_stats(stats_options)
+        .build()
+        .unwrap();
+    let mut replayed_paths = Vec::new();
+    for metadata in replay_scan
+        .scan_metadata_from(
+            engine.as_ref(),
+            1,
+            cached_metadata_schema,
+            cached_metadata,
+            None,
+        )
+        .unwrap()
+    {
+        replayed_paths = metadata
+            .unwrap()
+            .visit_scan_files(replayed_paths, |paths, file| {
+                paths.push(file.path.to_string());
+            })
+            .unwrap();
+    }
+
+    // Compare exact files without depending on iterator order.
+    fresh_paths.sort_unstable();
+    replayed_paths.sort_unstable();
+    assert_eq!(replayed_paths, fresh_paths);
+}
+
+#[test_log::test]
+fn test_scan_metadata_from_falls_back_from_incompatible_typed_stats() {
+    let path = fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
+    let url = Url::from_directory_path(path).unwrap();
+    let engine = Arc::new(SyncEngine::new());
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+    let version = snapshot.version();
+
+    // This cached row has valid JSON stats, but its typed `id` bounds are strings instead of the
+    // Long type required by the table.
+    let incompatible_stats_schema = schema_ref! {
+        nullable "numRecords": LONG,
+        nullable "minValues": { nullable "id": STRING },
+        nullable "maxValues": { nullable "id": STRING },
+        nullable "nullCount": { nullable "id": LONG },
+        nullable "tightBounds": BOOLEAN,
+    };
+    let cached_metadata_schema = Arc::new(
+        SchemaStructPatchBuilder::new()
+            .append(StructField::nullable(
+                STATS_PARSED_NAME,
+                incompatible_stats_schema.as_ref().clone(),
+            ))
+            .build(scan_row_schema().as_ref())
+            .unwrap(),
+    );
+    let cached_metadata = engine
+        .json_handler()
+        .parse_json(
+            string_array_to_engine_data(StringArray::from(vec![r#"
+                {
+                    "path": "cached.parquet",
+                    "size": 1,
+                    "modificationTime": 0,
+                    "stats": "{\"numRecords\":1,\"minValues\":{\"id\":1},\"maxValues\":{\"id\":1},\"nullCount\":{\"id\":0},\"tightBounds\":true}",
+                    "fileConstantValues": {"partitionValues": {}},
+                    "stats_parsed": {
+                        "numRecords": 1,
+                        "minValues": {"id": "not-a-long"},
+                        "maxValues": {"id": "not-a-long"},
+                        "nullCount": {"id": 0},
+                        "tightBounds": true
+                    }
+                }
+            "#])),
+            cached_metadata_schema.clone(),
+        )
+        .unwrap();
+
+    // JSON says the file cannot match `id > 400`, so fallback should prune the cached file.
+    let replay_scan = snapshot
+        .scan_builder()
+        .with_predicate(Arc::new(Pred::gt(col!("id"), lit(400i64))))
+        .build()
+        .unwrap();
+    let mut replayed_paths = Vec::new();
+    for metadata in replay_scan
+        .scan_metadata_from(
+            engine.as_ref(),
+            version,
+            cached_metadata_schema,
+            [cached_metadata],
+            None,
+        )
+        .unwrap()
+    {
+        replayed_paths = metadata
+            .unwrap()
+            .visit_scan_files(replayed_paths, |paths, file| {
+                paths.push(file.path.to_string());
+            })
+            .unwrap();
+    }
+
+    assert!(replayed_paths.is_empty());
 }
 
 // reading v0 with 3 files.
@@ -703,7 +1219,7 @@ fn test_scan_metadata_from_with_update() {
         .unwrap();
     let scan = snapshot.scan_builder().build().unwrap();
     let new_files: Vec<_> = scan
-        .scan_metadata_from(engine.as_ref(), 0, files, None)
+        .scan_metadata_from(engine.as_ref(), 0, scan_row_schema(), files, None)
         .unwrap()
         .map_ok(|ScanMetadata { scan_files, .. }| {
             let (underlying_data, selection_vector) = scan_files.into_parts();

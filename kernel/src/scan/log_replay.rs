@@ -237,6 +237,7 @@ impl ScanLogReplayProcessor {
             has_partition_values_parsed,
             checkpoint_read_schema,
         } = checkpoint_info.clone();
+        let checkpoint_has_json_stats = checkpoint_read_schema.contains_col(["add", "stats"]);
         let ScanStatsOptions {
             skip_stats,
             synthesize_json,
@@ -310,6 +311,7 @@ impl ScanLogReplayProcessor {
                 get_add_transform_expr(
                     stats_schema_for_transform.clone(),
                     false,
+                    false,
                     skip_stats,
                     synthesize_json,
                     partition_schema_for_transform.clone(),
@@ -323,6 +325,7 @@ impl ScanLogReplayProcessor {
                 get_add_transform_expr(
                     stats_schema_for_transform,
                     has_stats_parsed,
+                    checkpoint_has_json_stats,
                     skip_stats,
                     synthesize_json,
                     partition_schema_for_transform,
@@ -811,6 +814,9 @@ fn scan_row_schema_with_parsed_columns(
 ///   `synthesize_json` is true, stats output uses `COALESCE(add.stats, ToJson(add.stats_parsed))`
 ///   so that `ScanFile.stats` is populated even when the checkpoint lacks JSON stats
 ///   (writeStatsAsJson=false).
+/// - `has_json_stats`: Whether the input schema has `add.stats`. With typed stats and no
+///   synthesis, it is passed through when present (cached scan metadata keeps it) and nulled
+///   otherwise (a typed checkpoint read without JSON output omits it).
 /// - `skip_stats`: When true, replaces the stats column with a null literal, avoiding reads of the
 ///   JSON stats column in checkpoint parquet files.
 /// - `synthesize_json`: When false, disables the `ToJson(add.stats_parsed)` fallback regardless of
@@ -828,6 +834,7 @@ fn scan_row_schema_with_parsed_columns(
 fn get_add_transform_expr(
     physical_stats_schema: Option<SchemaRef>,
     has_stats_parsed: bool,
+    has_json_stats: bool,
     skip_stats: bool,
     synthesize_json: bool,
     partition_schema: Option<SchemaRef>,
@@ -842,6 +849,10 @@ fn get_add_transform_expr(
             col!("add.stats"),
             Expression::unary(UnaryExpressionOp::ToJson, col!("add.stats_parsed")),
         ]))
+    } else if has_stats_parsed && has_json_stats {
+        // Cached scan metadata keeps its JSON next to the typed stats; pass it through so a later
+        // scan can still use columns outside the typed stats schema.
+        column_expr_ref!("add.stats")
     } else if has_stats_parsed {
         // The compatible checkpoint projection can omit add.stats when JSON output is disabled.
         Arc::new(null_lit(DataType::STRING))
@@ -2024,6 +2035,7 @@ mod tests {
         let with_synthesis = get_add_transform_expr(
             Some(stats_schema.clone()),
             true,  // has_stats_parsed
+            false, // has_json_stats
             false, // skip_stats
             true,  // synthesize_json
             partition_schema.clone(),
@@ -2039,6 +2051,7 @@ mod tests {
         let without_synthesis = get_add_transform_expr(
             Some(stats_schema),
             true,  // has_stats_parsed
+            false, // has_json_stats
             false, // skip_stats
             false, // synthesize_json
             partition_schema,

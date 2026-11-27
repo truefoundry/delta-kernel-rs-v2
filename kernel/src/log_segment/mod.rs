@@ -880,6 +880,20 @@ impl LogSegment {
             .map(Some)
     }
 
+    /// The schema of the checkpoint file actions that log replay reads: the checkpoint's own
+    /// schema, or the first sidecar's when the checkpoint references sidecars. `None` without a
+    /// checkpoint. Replay takes typed stats from `add.stats_parsed` only when this schema has it,
+    /// so a connector can tell from it whether replayed stats came from JSON. May read a parquet
+    /// footer (or a sidecar's, for a V2 checkpoint) when `_last_checkpoint` has no schema hint.
+    #[allow(unused)]
+    #[internal_api]
+    pub(crate) fn checkpoint_file_actions_schema(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Option<SchemaRef>> {
+        Ok(self.get_file_actions_schema_and_sidecars(engine, None)?.0)
+    }
+
     /// Determines the file actions schema and extracts sidecar file references for checkpoints.
     ///
     /// This function analyzes the checkpoint to determine:
